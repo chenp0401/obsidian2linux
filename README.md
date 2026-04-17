@@ -220,14 +220,15 @@ LLM 对话  ──►  AutoGenLLMWiki 自动生成 Wiki 条目（Markdown）
 
 ---
 
-## 🙌 致谢
-- **[Syncthing](https://github.com/syncthing/syncthing)** —— 本项目的核心驱动。整个 `obsidian2linux` 的灵感正是来源于 Syncthing 出色的点对点、端到端加密同步能力；没有 Syncthing，就没有这个脚本。向 Syncthing 团队与所有贡献者致以最诚挚的谢意 🎉
-- **[Obsidian](https://github.com/obsidianmd/obsidian-releases)** —— 强烈推荐的本地优先 Markdown 笔记应用。所有笔记以纯 `.md` 文件存在你自己的磁盘上，配合本脚本的 Syncthing 同步，即可获得「本地优先 + 多端实时同步 + 端到端加密」的完美体验。如果你还没用过，点上面的链接下载试试。
-
----
-
 ## 📜 License
 
 本项目采用 **[MIT License](./LICENSE)** 授权，欢迎自由使用、修改与分发。
 
 > 注：本项目依赖的 [Syncthing](https://github.com/syncthing/syncthing) 为 [MPL-2.0](https://github.com/syncthing/syncthing/blob/main/LICENSE) 协议，版权归原项目所有，本仓库仅通过脚本调用其已发布的二进制，未对其源码进行修改或再分发。
+
+---
+
+## 🙌 致谢
+
+- **[Syncthing](https://github.com/syncthing/syncthing)** —— 本项目的核心驱动。整个 `obsidian2linux` 的灵感正是来源于 Syncthing 出色的点对点、端到端加密同步能力；没有 Syncthing，就没有这个脚本。向 Syncthing 团队与所有贡献者致以最诚挚的谢意 🎉
+- **[Obsidian](https://github.com/obsidianmd/obsidian-releases)** —— 强烈推荐的本地优先 Markdown 笔记应用。所有笔记以纯 `.md` 文件存在你自己的磁盘上，配合本脚本的 Syncthing 同步，即可获得「本地优先 + 多端实时同步 + 端到端加密」的完美体验。如果你还没用过，点上面的链接下载试试。
