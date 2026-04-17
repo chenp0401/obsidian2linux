@@ -27,36 +27,10 @@
 
 ---
 
-## 📦 系统要求
-
-### 本地（macOS）
-
-| 依赖      | 必需 | 说明                                   | 安装命令                                             |
-| --------- | ---- | -------------------------------------- | ---------------------------------------------------- |
-| `ssh`     | ✅   | 系统自带                               | —                                                    |
-| `curl`    | ✅   | 系统自带                               | —                                                    |
-| `sshpass` | 🔶   | 非交互式 SSH 密码登录（强烈推荐）      | `brew install hudochenkov/sshpass/sshpass`           |
-| `jq`      | 🔶   | 解析 Syncthing API 返回的 JSON         | `brew install jq`                                    |
-| `fzf`     | 🟡   | Vault 目录多选 TUI（无则降级数字菜单） | `brew install fzf`                                   |
-
-> 🔶 推荐安装；🟡 可选（没有时自动降级）。脚本首次运行会检查并给出安装提示。
-
-### 远端（Linux 服务器）
-
-- 支持 `apt` / `dnf` / `yum` 三大包管理器（Debian / Ubuntu / RHEL / CentOS / Rocky 等）
-- 建议有 `systemd`（用于开机自启 Syncthing 服务）
-- 可通过 SSH 密码或密钥登录，账户需具备 `sudo` 权限
-- 对外开放以下端口（脚本会尝试自动配置 `ufw` / `firewalld`）：
-  - `22000/tcp`、`22000/udp`（Syncthing 同步）
-  - `21027/udp`（本地发现，可选）
-
----
-
 ## 🚀 快速开始
 
 ```bash
-# 1. 克隆项目
-git clone https://github.com/chenp0401/obsidian2linux.git
+# 1. 克隆项目git clone https://github.com/chenp0401/obsidian2linux.git
 cd obsidian2linux
 
 # 2. 赋予执行权限
@@ -88,6 +62,41 @@ chmod +x obsidian-sync.sh
 - 远端 Syncthing GUI 的访问地址与一次性密码
 - 本地 Syncthing GUI 的访问地址
 - 状态文件路径 `~/.obsidian-sync/last-run.json`
+
+---
+
+## ☁️ 还没有自己的服务器？一键部署 OpenClaw
+
+如果你还没有部署自己的 **OpenClaw**（用于跑 Syncthing / 其它自托管服务的 Linux 云端），下面两条路径任选其一即可最快上手：
+
+- 🚀 **CVM 一键部署**：通过 [腾讯云应用 · OpenClaw 一键部署镜像](https://app.cloud.tencent.com/detail/SPU_BHGJGAFIIJ7195) 在 CVM 上快速启动，免去手动环境配置，开机即用。
+- 💡 **轻量云部署**：购买 [腾讯云轻量应用服务器 2 核 4G](https://cloud.tencent.com/act/cps/redirect?redirect=38185&cps_key=722b0c190220a288e06aff97161cdc4d) 来部署 OpenClaw，**性价比高、开箱即用**，个人自托管绰绰有余。
+
+拿到服务器后，直接回到本 README 的 [🚀 快速开始](#-快速开始) 章节，跑一次 `./obsidian-sync.sh` 即可把 Obsidian 与这台服务器打通 ✅
+
+---
+
+## 📦 系统要求
+
+### 本地（macOS）
+| 依赖      | 必需 | 说明                                   | 安装命令                                             |
+| --------- | ---- | -------------------------------------- | ---------------------------------------------------- |
+| `ssh`     | ✅   | 系统自带                               | —                                                    |
+| `curl`    | ✅   | 系统自带                               | —                                                    |
+| `sshpass` | 🔶   | 非交互式 SSH 密码登录（强烈推荐）      | `brew install hudochenkov/sshpass/sshpass`           |
+| `jq`      | 🔶   | 解析 Syncthing API 返回的 JSON         | `brew install jq`                                    |
+| `fzf`     | 🟡   | Vault 目录多选 TUI（无则降级数字菜单） | `brew install fzf`                                   |
+
+> 🔶 推荐安装；🟡 可选（没有时自动降级）。脚本首次运行会检查并给出安装提示。
+
+### 远端（Linux 服务器）
+
+- 支持 `apt` / `dnf` / `yum` 三大包管理器（Debian / Ubuntu / RHEL / CentOS / Rocky 等）
+- 建议有 `systemd`（用于开机自启 Syncthing 服务）
+- 可通过 SSH 密码或密钥登录，账户需具备 `sudo` 权限
+- 对外开放以下端口（脚本会尝试自动配置 `ufw` / `firewalld`）：
+  - `22000/tcp`、`22000/udp`（Syncthing 同步）
+  - `21027/udp`（本地发现，可选）
 
 ---
 
@@ -128,21 +137,6 @@ obsidian2linux/
 
 ---
 
-## 🧩 脚本架构（开发者向）
-
-```
-ui            —— 终端交互与彩色输出
-ssh           —— 远程命令执行 / 文件读写
-local         —— 本地 Mac 端 Syncthing 安装与管理
-remote        —— 服务器端 Syncthing 部署与管理
-syncthing_api —— Syncthing REST API 封装
-state         —— 运行状态持久化（last-run.json）
-```
-
-主流程由 `main()` 统一调度：依赖检查 → 选择动作 → 收集输入 → 部署远端 / 建立隧道 / 本地安装 → 设备配对 → 选择 Vault → 创建共享文件夹 → 保存状态。
-
----
-
 ## 🛠 环境变量（高级用法）
 
 | 变量                            | 默认 | 说明                                                                   |
@@ -155,6 +149,21 @@ state         —— 运行状态持久化（last-run.json）
 ```bash
 OBSIDIAN_SYNC_PEER_WAIT=120 ./obsidian-sync.sh
 ```
+
+---
+
+## 🧩 脚本架构（开发者向）
+
+```
+ui            —— 终端交互与彩色输出
+ssh           —— 远程命令执行 / 文件读写
+local         —— 本地 Mac 端 Syncthing 安装与管理
+remote        —— 服务器端 Syncthing 部署与管理
+syncthing_api —— Syncthing REST API 封装
+state         —— 运行状态持久化（last-run.json）
+```
+
+主流程由 `main()` 统一调度：依赖检查 → 选择动作 → 收集输入 → 部署远端 / 建立隧道 / 本地安装 → 设备配对 → 选择 Vault → 创建共享文件夹 → 保存状态。
 
 ---
 
@@ -174,14 +183,6 @@ OBSIDIAN_SYNC_PEER_WAIT=120 ./obsidian-sync.sh
 - 运行日志 (`run.log`) **不记录任何密码**，仅包含步骤与非敏感字段。
 - macOS 上可选将 SSH 密码写入 **Keychain**（`security` 命令），避免重复输入。
 - Syncthing 自身使用 TLS + 每台设备唯一的 Device ID 做端到端加密。
-
----
-
-## 📜 License
-
-本项目采用 **[MIT License](./LICENSE)** 授权，欢迎自由使用、修改与分发。
-
-> 注：本项目依赖的 [Syncthing](https://github.com/syncthing/syncthing) 为 [MPL-2.0](https://github.com/syncthing/syncthing/blob/main/LICENSE) 协议，版权归原项目所有，本仓库仅通过脚本调用其已发布的二进制，未对其源码进行修改或再分发。
 
 ---
 
@@ -219,17 +220,14 @@ LLM 对话  ──►  AutoGenLLMWiki 自动生成 Wiki 条目（Markdown）
 
 ---
 
-## ☁️ 还没有自己的服务器？一键部署 OpenClaw
-
-如果你还没有部署自己的 **OpenClaw**（用于跑 Syncthing / 其它自托管服务的 Linux 云端），下面两条路径任选其一即可最快上手：
-
-- 🚀 **CVM 一键部署**：通过 [腾讯云应用 · OpenClaw 一键部署镜像](https://app.cloud.tencent.com/detail/SPU_BHGJGAFIIJ7195) 在 CVM 上快速启动，免去手动环境配置，开机即用。
-- 💡 **轻量云部署**：购买 [腾讯云轻量应用服务器 2 核 4G](https://cloud.tencent.com/act/cps/redirect?redirect=38185&cps_key=722b0c190220a288e06aff97161cdc4d) 来部署 OpenClaw，**性价比高、开箱即用**，个人自托管绰绰有余。
-
-拿到服务器后，直接回到本 README 的 [🚀 快速开始](#-快速开始) 章节，跑一次 `./obsidian-sync.sh` 即可把 Obsidian 与这台服务器打通 ✅
-
----
-
 ## 🙌 致谢
 - **[Syncthing](https://github.com/syncthing/syncthing)** —— 本项目的核心驱动。整个 `obsidian2linux` 的灵感正是来源于 Syncthing 出色的点对点、端到端加密同步能力；没有 Syncthing，就没有这个脚本。向 Syncthing 团队与所有贡献者致以最诚挚的谢意 🎉
 - **[Obsidian](https://github.com/obsidianmd/obsidian-releases)** —— 强烈推荐的本地优先 Markdown 笔记应用。所有笔记以纯 `.md` 文件存在你自己的磁盘上，配合本脚本的 Syncthing 同步，即可获得「本地优先 + 多端实时同步 + 端到端加密」的完美体验。如果你还没用过，点上面的链接下载试试。
+
+---
+
+## 📜 License
+
+本项目采用 **[MIT License](./LICENSE)** 授权，欢迎自由使用、修改与分发。
+
+> 注：本项目依赖的 [Syncthing](https://github.com/syncthing/syncthing) 为 [MPL-2.0](https://github.com/syncthing/syncthing/blob/main/LICENSE) 协议，版权归原项目所有，本仓库仅通过脚本调用其已发布的二进制，未对其源码进行修改或再分发。
