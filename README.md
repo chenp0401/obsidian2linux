@@ -30,7 +30,8 @@
 ## 🚀 快速开始
 
 ```bash
-# 1. 克隆项目git clone https://github.com/chenp0401/obsidian2linux.git
+# 1. 克隆项目
+git clone https://github.com/chenp0401/obsidian2linux.git
 cd obsidian2linux
 
 # 2. 赋予执行权限
