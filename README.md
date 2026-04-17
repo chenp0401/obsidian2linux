@@ -95,9 +95,37 @@ chmod +x obsidian-sync.sh
 - 支持 `apt` / `dnf` / `yum` 三大包管理器（Debian / Ubuntu / RHEL / CentOS / Rocky 等）
 - 建议有 `systemd`（用于开机自启 Syncthing 服务）
 - 可通过 SSH 密码或密钥登录，账户需具备 `sudo` 权限
-- 对外开放以下端口（脚本会尝试自动配置 `ufw` / `firewalld`）：
-  - `22000/tcp`、`22000/udp`（Syncthing 同步）
-  - `21027/udp`（本地发现，可选）
+
+#### 🔥 云厂商安全组 / 防火墙放行清单
+
+脚本会尝试自动配置服务器内的 `ufw` / `firewalld`，但**云厂商控制台的安全组/轻量防火墙需要你手动放行**（否则 SSH 都连不上）。
+
+**✅ 必须放行（缺一不可）**
+
+| 协议/端口     | 方向 | 用途                                                | 建议来源             |
+| ------------- | ---- | --------------------------------------------------- | -------------------- |
+| `TCP 22`      | 入站 | SSH 登录 —— 脚本的所有远端操作都基于 SSH           | 本机公网 IP/32 最佳 |
+| `TCP 22000`   | 入站 | Syncthing 设备间同步（TCP 通道，文件主力传输）      | `0.0.0.0/0`          |
+| `UDP 22000`   | 入站 | Syncthing 同步的 QUIC 通道（NAT 穿透 / 弱网主力）   | `0.0.0.0/0`          |
+
+**🟡 可选放行**
+
+| 协议/端口     | 方向 | 用途                         | 说明                                              |
+| ------------- | ---- | ---------------------------- | ------------------------------------------------- |
+| `UDP 21027`   | 入站 | Syncthing 局域网发现（广播） | 纯公网服务器基本用不上，同局域网多设备时才有意义 |
+
+**🔒 强烈建议「不要」对公网开放**
+
+| 协议/端口     | 原因                                                                                                                |
+| ------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `TCP 8384`    | Syncthing Web UI。脚本已通过 `ssh -L 18384:127.0.0.1:8384` 建立本地端口转发，你在本机访问的是 `http://127.0.0.1:18384`，**公网暴露 8384 会让任何人扫到你的 Syncthing 后台**。 |
+
+**腾讯云控制台直达入口**
+
+- CVM 安全组：<https://console.cloud.tencent.com/cvm/securitygroup>
+- 轻量应用服务器防火墙：<https://console.cloud.tencent.com/lighthouse/instance/index> → 实例详情 → 防火墙
+
+> 💡 脚本在 SSH 首次握手失败时，会自动在终端打印同款清单 + 控制台链接，不需要背端口号。
 
 ---
 
@@ -172,7 +200,8 @@ state         —— 运行状态持久化（last-run.json）
 
 - **想看完整运行日志**：`less ~/.obsidian-sync/run.log`
 - **远端 Syncthing 状态**：`ssh user@host 'systemctl --user status syncthing'`（或 `systemctl status syncthing@用户名`）
-- **端口是否通**：`nc -zv <服务器IP> 22000`
+- **端口是否通**：`nc -zv <服务器IP> 22` 检查 SSH；`nc -zv <服务器IP> 22000` 检查 Syncthing TCP 通道
+- **UDP 端口自检**：`nc -zuv <服务器IP> 22000`（macOS 上 `nc` 对 UDP 探测不完全可靠，失败不一定代表不通，以 Syncthing GUI 里 `Connected (TCP/QUIC)` 状态为准）
 - **重新来一次**：删除 `~/.obsidian-sync/last-run.json` 后重跑脚本，可触发全新部署。
 - **已有 Syncthing 冲突**：脚本在安装阶段会检测并清理包管理器装的旧版 Syncthing，如遇异常可手动 `apt purge syncthing` / `dnf remove syncthing` 后重跑。
 
