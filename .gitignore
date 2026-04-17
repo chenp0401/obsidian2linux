@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE / 本地工具的工作区状态（不发布）
+.codebuddy/
+.workbuddy/
+.idea/
+.vscode/
+*.swp
+
+# 本地笔记/排障文档（按项目约定不公开）
+SSL证书问题排查与解决方案.md
+
+# Syncthing 脚本运行时产物（如果有人在仓库根目录里跑脚本）
+.obsidian-sync/
+run.log
+last-run.json

@@ -185,7 +185,51 @@ OBSIDIAN_SYNC_PEER_WAIT=120 ./obsidian-sync.sh
 
 ---
 
-## 🙌 致谢
+## 🔗 相关项目推荐
 
+### 🧠 [AutoGenLLMWiki](https://github.com/chenp0401/AutoGenLLMWiki) —— 让 AI 自动生成你的个人 LLM Wiki
+如果你喜欢 `obsidian2linux` 把笔记「本地优先 + 多端同步」的思路，那一定也会喜欢这个配套项目：
+
+> **AutoGenLLMWiki** 是一个基于 [Andrej Karpathy 的 LLM Wiki 理念](https://karpathy.bearblog.dev/) 设计的**个人知识库系统**，由 AI 自动生成与维护，让每一次和大模型的对话都能沉淀成结构化、可检索、可持续演进的知识资产。
+
+- 🤖 **AI 自动建 Wiki**：把和 LLM 的高质量问答 / 调研结果，一键整理成规范的 Wiki 条目，而非散落各处的聊天记录。
+- 🧩 **Karpathy 风格的知识组织**：围绕「概念 → 关联 → 索引」的方式组织条目，更贴近人脑的学习与检索习惯。
+- 📂 **纯 Markdown 输出**：生成的 Wiki 文件是标准 `.md`，天然兼容 Obsidian；配合 `obsidian2linux`，可以直接**同步到 Linux 服务器、多端实时可用**。
+- 🔒 **本地优先**：知识资产存在你自己的磁盘里，随时带走、随时开源、随时托管。
+- 🛠 **可编程、可扩展**：支持接入不同的 LLM 后端，按自己的工作流裁剪 Prompt 与生成模板。
+
+**推荐组合玩法 🎯**
+
+```
+LLM 对话  ──►  AutoGenLLMWiki 自动生成 Wiki 条目（Markdown）
+                    │
+                    ▼
+              Obsidian Vault（本地优先，所见即所得）
+                    │
+                    ▼
+        obsidian2linux（Syncthing 端到端加密同步）
+                    │
+                    ▼
+      Linux 云端服务器 / 其它 Mac / iOS / Android 多端实时可用
+```
+
+一句话：**用 AutoGenLLMWiki 积累知识，用 Obsidian 阅读与编辑，用 obsidian2linux 跨端同步** —— 一个完整的「AI 时代个人知识资产」闭环。
+
+> 👉 戳这里了解更多：<https://github.com/chenp0401/AutoGenLLMWiki> 欢迎 Star / Issue / PR！
+
+---
+
+## ☁️ 还没有自己的服务器？一键部署 OpenClaw
+
+如果你还没有部署自己的 **OpenClaw**（用于跑 Syncthing / 其它自托管服务的 Linux 云端），下面两条路径任选其一即可最快上手：
+
+- 🚀 **CVM 一键部署**：通过 [腾讯云市场 · OpenClaw 一键部署镜像](https://app.cloud.tencent.com/detail/SPU_BHGJGAFIIJ7195) 在 CVM 上快速启动，免去手动环境配置，开机即用。
+- 💡 **轻量云部署**：购买 [腾讯云轻量应用服务器 2 核 4G](https://cloud.tencent.com/act/cps/redirect?redirect=38185&cps_key=722b0c190220a288e06aff97161cdc4d) 来部署 OpenClaw，**性价比高、开箱即用**，个人自托管绰绰有余。
+
+拿到服务器后，直接回到本 README 的 [🚀 快速开始](#-快速开始) 章节，跑一次 `./obsidian-sync.sh` 即可把 Obsidian 与这台服务器打通 ✅
+
+---
+
+## 🙌 致谢
 - **[Syncthing](https://github.com/syncthing/syncthing)** —— 本项目的核心驱动。整个 `obsidian2linux` 的灵感正是来源于 Syncthing 出色的点对点、端到端加密同步能力；没有 Syncthing，就没有这个脚本。向 Syncthing 团队与所有贡献者致以最诚挚的谢意 🎉
 - **[Obsidian](https://github.com/obsidianmd/obsidian-releases)** —— 强烈推荐的本地优先 Markdown 笔记应用。所有笔记以纯 `.md` 文件存在你自己的磁盘上，配合本脚本的 Syncthing 同步，即可获得「本地优先 + 多端实时同步 + 端到端加密」的完美体验。如果你还没用过，点上面的链接下载试试。
