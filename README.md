@@ -223,7 +223,7 @@ LLM 对话  ──►  AutoGenLLMWiki 自动生成 Wiki 条目（Markdown）
 
 如果你还没有部署自己的 **OpenClaw**（用于跑 Syncthing / 其它自托管服务的 Linux 云端），下面两条路径任选其一即可最快上手：
 
-- 🚀 **CVM 一键部署**：通过 [腾讯云市场 · OpenClaw 一键部署镜像](https://app.cloud.tencent.com/detail/SPU_BHGJGAFIIJ7195) 在 CVM 上快速启动，免去手动环境配置，开机即用。
+- 🚀 **CVM 一键部署**：通过 [腾讯云应用 · OpenClaw 一键部署镜像](https://app.cloud.tencent.com/detail/SPU_BHGJGAFIIJ7195) 在 CVM 上快速启动，免去手动环境配置，开机即用。
 - 💡 **轻量云部署**：购买 [腾讯云轻量应用服务器 2 核 4G](https://cloud.tencent.com/act/cps/redirect?redirect=38185&cps_key=722b0c190220a288e06aff97161cdc4d) 来部署 OpenClaw，**性价比高、开箱即用**，个人自托管绰绰有余。
 
 拿到服务器后，直接回到本 README 的 [🚀 快速开始](#-快速开始) 章节，跑一次 `./obsidian-sync.sh` 即可把 Obsidian 与这台服务器打通 ✅
