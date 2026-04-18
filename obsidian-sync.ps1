@@ -296,6 +296,94 @@ function Check-Dependencies {
     }
 }
 
+# ---------------------------------------------------------------------------
+# 工具：带进度条的下载（显示速度/百分比/已下载大小）
+# ---------------------------------------------------------------------------
+function Invoke-DownloadWithProgress {
+    param(
+        [Parameter(Mandatory=$true)][string]$Url,
+        [Parameter(Mandatory=$true)][string]$OutFile,
+        [int]$TimeoutSec = 30,
+        [string]$Activity = "下载中"
+    )
+    
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.Method = "GET"
+    $request.Timeout = $TimeoutSec * 1000
+    $request.ReadWriteTimeout = $TimeoutSec * 1000
+    $request.UserAgent = "PowerShell/obsidian-sync"
+    
+    Write-Host "   ↳ 正在连接 $Url ..." -ForegroundColor DarkGray
+    $response = $request.GetResponse()
+    $totalBytes = $response.ContentLength
+    $totalMB = if ($totalBytes -gt 0) { [Math]::Round($totalBytes / 1MB, 2) } else { 0 }
+    
+    if ($totalBytes -gt 0) {
+        Write-Host "   ↳ 已建立连接，文件大小：$totalMB MB" -ForegroundColor DarkGray
+    } else {
+        Write-Host "   ↳ 已建立连接，文件大小未知（服务端未返回 Content-Length）" -ForegroundColor DarkGray
+    }
+    
+    $stream = $response.GetResponseStream()
+    $fileStream = [System.IO.File]::Create($OutFile)
+    
+    $buffer = New-Object byte[] 8192
+    $totalRead = 0
+    $lastUpdate = [DateTime]::Now
+    $startTime = [DateTime]::Now
+    
+    try {
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $fileStream.Write($buffer, 0, $read)
+            $totalRead += $read
+            
+            # 每 200ms 刷新一次进度，避免刷屏
+            $now = [DateTime]::Now
+            if (($now - $lastUpdate).TotalMilliseconds -ge 200 -or $totalRead -eq $totalBytes) {
+                $elapsedSec = ($now - $startTime).TotalSeconds
+                $speedKB = if ($elapsedSec -gt 0) { [Math]::Round($totalRead / 1KB / $elapsedSec, 1) } else { 0 }
+                $downloadedMB = [Math]::Round($totalRead / 1MB, 2)
+                
+                if ($totalBytes -gt 0) {
+                    $percent = [Math]::Min([Math]::Round(($totalRead / $totalBytes) * 100, 1), 100)
+                    Write-Progress -Activity $Activity -Status "$downloadedMB MB / $totalMB MB  ($speedKB KB/s)" -PercentComplete $percent
+                } else {
+                    Write-Progress -Activity $Activity -Status "$downloadedMB MB 已下载 ($speedKB KB/s)"
+                }
+                $lastUpdate = $now
+            }
+        }
+    } finally {
+        $fileStream.Close()
+        $stream.Close()
+        $response.Close()
+        Write-Progress -Activity $Activity -Completed
+    }
+    
+    $elapsedTotal = [Math]::Round(([DateTime]::Now - $startTime).TotalSeconds, 1)
+    $finalMB = [Math]::Round($totalRead / 1MB, 2)
+    Write-Host "   ↳ 下载完成：$finalMB MB，用时 $elapsedTotal 秒" -ForegroundColor DarkGray
+}
+
+function Test-UrlReachable {
+    param(
+        [string]$Url,
+        [int]$TimeoutSec = 8
+    )
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($Url)
+        $request.Method = "HEAD"
+        $request.Timeout = $TimeoutSec * 1000
+        $request.UserAgent = "PowerShell/obsidian-sync"
+        $response = $request.GetResponse()
+        $size = $response.ContentLength
+        $response.Close()
+        return @{ Ok = $true; Size = $size }
+    } catch {
+        return @{ Ok = $false; Error = $_.Exception.Message }
+    }
+}
+
 function Install-Chocolatey {
     Write-Step "安装 Chocolatey 包管理器（使用国内镜像加速）"
     
@@ -334,25 +422,87 @@ function Install-Chocolatey {
             }
         )
         
+        # 准备临时目录
+        $tmpDir = Join-Path $env:TEMP "obsidian-sync-choco"
+        if (-not (Test-Path $tmpDir)) {
+            New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+        }
+        
         $installed = $false
+        $mirrorIndex = 0
+        $totalMirrors = $mirrors.Count
+        
         foreach ($mirror in $mirrors) {
-            Write-Info "尝试使用镜像：$($mirror.Name)"
+            $mirrorIndex++
+            Write-Info "[$mirrorIndex/$totalMirrors] 尝试使用镜像：$($mirror.Name)"
+            
             try {
-                if ($mirror.PackageUrl) {
-                    # 通过环境变量指定 nupkg 下载地址，让官方脚本从镜像拉包
-                    $env:chocolateyDownloadUrl = $mirror.PackageUrl
-                    $env:chocolateyVersion = ""
+                # ---- 阶段 1：连通性探测（最多 3 次重试） ----
+                $probeUrl = if ($mirror.PackageUrl) { $mirror.PackageUrl } else { $mirror.InstallScriptUrl }
+                $reachable = $false
+                $probeSize = 0
+                
+                for ($attempt = 1; $attempt -le 3; $attempt++) {
+                    Write-Host "   ↳ [阶段 1/3] 连通性探测（第 $attempt/3 次）：$probeUrl" -ForegroundColor DarkGray
+                    $probeStart = [DateTime]::Now
+                    $probe = Test-UrlReachable -Url $probeUrl -TimeoutSec 8
+                    $probeElapsed = [Math]::Round(([DateTime]::Now - $probeStart).TotalSeconds, 1)
+                    
+                    if ($probe.Ok) {
+                        Write-Host "   ↳ 连通性 OK（用时 $probeElapsed 秒，大小 $([Math]::Round($probe.Size/1MB,2)) MB）" -ForegroundColor DarkGray
+                        $reachable = $true
+                        $probeSize = $probe.Size
+                        break
+                    } else {
+                        Write-Warn "   第 $attempt/3 次探测失败（用时 $probeElapsed 秒）：$($probe.Error)"
+                        if ($attempt -lt 3) {
+                            Write-Host "   ↳ 2 秒后重试..." -ForegroundColor DarkGray
+                            Start-Sleep -Seconds 2
+                        }
+                    }
                 }
                 
-                $scriptUrl = if ($mirror.InstallScriptUrl) { $mirror.InstallScriptUrl } else { "https://community.chocolatey.org/install.ps1" }
+                if (-not $reachable) {
+                    Write-Warn "镜像 $($mirror.Name) 无法连通，切换下一个镜像"
+                    continue
+                }
                 
-                # 设置下载超时（30秒）
-                $webClient = New-Object System.Net.WebClient
-                $webClient.Headers.Add("User-Agent", "PowerShell")
-                $installScript = $webClient.DownloadString($scriptUrl)
+                # ---- 阶段 2：下载安装脚本 / 安装包 ----
+                if ($mirror.PackageUrl) {
+                    # 下载 nupkg 到本地
+                    $localNupkg = Join-Path $tmpDir "chocolatey.nupkg"
+                    Write-Info "[阶段 2/3] 下载 Chocolatey 安装包..."
+                    Invoke-DownloadWithProgress -Url $mirror.PackageUrl -OutFile $localNupkg -TimeoutSec 60 -Activity "下载 Chocolatey 安装包（$($mirror.Name)）"
+                    
+                    # 用本地 file:// URL 让官方安装脚本从本地读取 nupkg
+                    $env:chocolateyDownloadUrl = "file:///" + $localNupkg.Replace("\", "/")
+                    $env:chocolateyVersion = ""
+                    
+                    # 下载官方安装脚本（很小，但也显示进度）
+                    $scriptUrl = "https://community.chocolatey.org/install.ps1"
+                } else {
+                    $scriptUrl = $mirror.InstallScriptUrl
+                }
                 
-                Write-Info "从 $($mirror.Name) 下载安装包并执行..."
+                $localScript = Join-Path $tmpDir "install.ps1"
+                Write-Info "[阶段 2/3] 下载安装脚本 install.ps1..."
+                try {
+                    Invoke-DownloadWithProgress -Url $scriptUrl -OutFile $localScript -TimeoutSec 30 -Activity "下载 Chocolatey 安装脚本"
+                } catch {
+                    Write-Warn "安装脚本下载失败：$($_.Exception.Message)"
+                    continue
+                }
+                
+                # ---- 阶段 3：执行安装 ----
+                Write-Info "[阶段 3/3] 执行 Chocolatey 安装脚本（可能需要 30-60 秒）..."
+                Write-Host "   ↳ Chocolatey 自身正在解压、注册 PATH、刷新环境..." -ForegroundColor DarkGray
+                $installStart = [DateTime]::Now
+                
+                $installScript = Get-Content -Path $localScript -Raw -Encoding UTF8
                 Invoke-Expression $installScript
+                
+                $installElapsed = [Math]::Round(([DateTime]::Now - $installStart).TotalSeconds, 1)
+                Write-Host "   ↳ 安装脚本执行完毕，用时 $installElapsed 秒" -ForegroundColor DarkGray
                 
                 # 刷新环境变量
                 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
@@ -361,6 +511,8 @@ function Install-Chocolatey {
                     Write-Ok "Chocolatey 安装成功（使用 $($mirror.Name) 镜像）"
                     $installed = $true
                     break
+                } else {
+                    Write-Warn "安装脚本已执行但未检测到 choco 命令，尝试下一个镜像"
                 }
             } catch {
                 Write-Warn "使用 $($mirror.Name) 镜像安装失败：$($_.Exception.Message)"
@@ -371,6 +523,9 @@ function Install-Chocolatey {
                 Remove-Item Env:\chocolateyVersion -ErrorAction SilentlyContinue
             }
         }
+        
+        # 清理临时目录
+        Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
         
         if (-not $installed) {
             throw "所有镜像源均安装失败，请检查网络或手动安装 Chocolatey"
