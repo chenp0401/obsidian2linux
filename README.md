@@ -108,6 +108,21 @@ PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
 - **Windows 服务管理** - sc.exe 服务控制
 - **Windows 凭据管理器** - 安全存储密码
 - **PowerShell 彩色输出** - 友好的交互界面
+- **远程桌面编码修复** - 自动检测并修复远程桌面环境下的乱码问题
+
+### 🖥️ 远程桌面使用说明
+如果在远程桌面环境下运行脚本时遇到**中文乱码**问题，脚本会自动检测并修复：
+
+1. **自动编码修复**：脚本启动时自动检测控制台编码，如发现非UTF-8编码会自动修复
+2. **手动测试**：如需单独测试编码修复效果，可运行：
+```powershell
+PowerShell -ExecutionPolicy Bypass -File test-encoding.ps1
+```
+3. **手动修复**：如自动修复失败，可手动执行：
+```powershell
+chcp 65001  # 设置控制台代码页为UTF-8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+```
 
 详细使用说明请查看：[Windows 版本文档](README-Windows.md)
 
