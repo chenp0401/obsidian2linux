@@ -73,7 +73,7 @@ chcp 65001 | Out-Null
     $hasEncodingSetting = $false
     if (Test-Path $profilePath) {
         $content = Get-Content $profilePath -Raw
-        if ($content -match "UTF-8|65001|OutputEncoding") {
+        if ($content -match "UTF-8" -or $content -match "65001" -or $content -match "OutputEncoding") {
             $hasEncodingSetting = $true
         }
     }
