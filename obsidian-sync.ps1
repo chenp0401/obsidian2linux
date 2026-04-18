@@ -603,6 +603,170 @@ function Repair-ChocolateySources {
     }
 }
 
+# ---------------------------------------------------------------------------
+# 包装 choco install：自动识别临时性网络错误（503/超时/连接重置）并重试
+# 返回一个 hashtable：@{ Success=bool; Output=string; IsNetworkError=bool; IsChocoBroken=bool }
+# 调用方可根据 IsNetworkError / IsChocoBroken 给出更准确的提示
+# ---------------------------------------------------------------------------
+function Invoke-ChocoInstallWithRetry {
+    param(
+        [Parameter(Mandatory=$true)][string]$PackageName,
+        [int]$MaxRetries = 4,
+        [int]$InitialDelaySec = 3
+    )
+    
+    # 备用源：第 1-2 次用默认源，第 3 次显式指定官方源，第 4 次切到 CDN 源
+    # packages.chocolatey.org 是官方的直接包下载 CDN，community.chocolatey.org 503 时常可用
+    $sourceRotation = @(
+        $null,                                                  # 默认源（使用 choco.config 里的）
+        $null,
+        "https://community.chocolatey.org/api/v2/",             # 显式官方源
+        "https://packages.chocolatey.org/"                      # 备用 CDN
+    )
+    
+    $attempt = 0
+    $delay = $InitialDelaySec
+    $lastOutput = ""
+    
+    while ($attempt -lt $MaxRetries) {
+        $attempt++
+        $srcForThisTry = $sourceRotation[[Math]::Min($attempt - 1, $sourceRotation.Count - 1)]
+        
+        $label = if ($srcForThisTry) { "备用源: $srcForThisTry" } else { "默认源" }
+        if ($attempt -eq 1) {
+            Write-Info "正在执行: choco install $PackageName -y ($label)"
+        } else {
+            Write-Info "重试 $attempt/$MaxRetries：choco install $PackageName -y ($label)"
+        }
+        
+        if ($srcForThisTry) {
+            $chocoOutput = & choco install $PackageName -y --no-progress -s="$srcForThisTry" 2>&1
+        } else {
+            $chocoOutput = & choco install $PackageName -y --no-progress 2>&1
+        }
+        $exitCode = $LASTEXITCODE
+        $chocoOutput | ForEach-Object { Write-Host "   ↳ $_" -ForegroundColor DarkGray }
+        $outputText = ($chocoOutput | Out-String)
+        $lastOutput = $outputText
+        
+        # 判定：本体损坏的特征（不可重试）
+        $isChocoBroken = ($outputText -match "is not a valid nupkg file") -or 
+                         ($outputText -match "Chocolatey installed 0/0 packages" -and $outputText -notmatch "503" -and $outputText -notmatch "Unable to find package")
+        
+        # 判定：网络性临时错误（可重试）
+        $isNetworkError = ($outputText -match "503") -or 
+                          ($outputText -match "Service Unavailable") -or
+                          ($outputText -match "Failed to fetch results from V2 feed") -or
+                          ($outputText -match "unable to connect to the remote server") -or
+                          ($outputText -match "The operation has timed out") -or
+                          ($outputText -match "连接被关闭") -or
+                          ($outputText -match "响应状态代码不指示成功") -or
+                          ($outputText -match "NuGetResolverInputException")
+        
+        # 判定：成功安装
+        $isSuccess = ($exitCode -eq 0) -and 
+                     ($outputText -match "Chocolatey installed 1/1 packages" -or
+                      $outputText -match "Chocolatey installed \d+/\d+ packages" -and $outputText -notmatch "installed 0/\d+ packages") -and
+                     (-not $isChocoBroken)
+        
+        if ($isSuccess) {
+            return @{ Success = $true; Output = $outputText; IsNetworkError = $false; IsChocoBroken = $false; Attempts = $attempt }
+        }
+        
+        # 本体损坏→立即返回，不重试
+        if ($isChocoBroken) {
+            return @{ Success = $false; Output = $outputText; IsNetworkError = $false; IsChocoBroken = $true; Attempts = $attempt }
+        }
+        
+        # 网络性错误→指数退避后重试
+        if ($isNetworkError -and $attempt -lt $MaxRetries) {
+            Write-Warn "检测到临时性网络错误（第 $attempt/$MaxRetries 次），$delay 秒后重试..."
+            Start-Sleep -Seconds $delay
+            $delay = [Math]::Min($delay * 2, 15)
+            continue
+        }
+        
+        # 其他错误（非网络、非 choco 损坏）：也给一次重试机会
+        if ($attempt -lt $MaxRetries) {
+            Write-Warn "choco install 失败（exit=$exitCode，第 $attempt/$MaxRetries 次），$delay 秒后重试..."
+            Start-Sleep -Seconds $delay
+            $delay = [Math]::Min($delay * 2, 15)
+        }
+    }
+    
+    # 所有重试均失败
+    return @{ Success = $false; Output = $lastOutput; IsNetworkError = $true; IsChocoBroken = $false; Attempts = $attempt }
+}
+
+# ---------------------------------------------------------------------------
+# 从 GitHub 镜像直接下载 PuTTY 便携版（choco 完全不可用时的最后 Fallback）
+# PuTTY 官方不在 GitHub，但有多个顶级镜像源：
+#   - https://the.earth.li/~sgtatham/putty/latest/w64/   （官方，国内访问不稳定）
+#   - https://tartarus.org/~simon/putty-snapshots/w64/    （官方快照）
+# 这里我们采用官方压缩包（不需安装，解压即用），装到 ~/.obsidian-sync/bin 后加入 PATH
+# ---------------------------------------------------------------------------
+function Install-PuTTYFromFallback {
+    Write-Info "尝试从官方备用下载 PuTTY 便携包（绕开 Chocolatey）..."
+    
+    $destDir = Join-Path $env:USERPROFILE ".obsidian-sync\bin\putty"
+    if (-not (Test-Path $destDir)) {
+        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+    }
+    
+    # 只需要 plink.exe，不需要整个 PuTTY 套件
+    # 官方提供单独的 plink.exe下载：https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe
+    $mirrorUrls = @(
+        "https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe",
+        "https://tartarus.org/~simon/putty-snapshots/w64/plink.exe"
+    )
+    
+    $plinkDest = Join-Path $destDir "plink.exe"
+    $downloaded = $false
+    foreach ($url in $mirrorUrls) {
+        try {
+            Write-Info "下载: $url"
+            Invoke-DownloadWithProgress -Url $url -OutFile $plinkDest -TimeoutSec 90 -Activity "下载 plink.exe"
+            # 简单验证：MZ 头（Windows PE 可执行文件魔数）
+            $fs = [System.IO.File]::OpenRead($plinkDest)
+            $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte()
+            $fs.Close()
+            if ($b0 -eq 0x4D -and $b1 -eq 0x5A) {
+                $downloaded = $true
+                break
+            } else {
+                Remove-Item $plinkDest -Force -ErrorAction SilentlyContinue
+                Write-Warn "下载的文件不是有效的 Windows 可执行文件，切换下一个源"
+            }
+        } catch {
+            Write-Warn "下载失败: $($_.Exception.Message)"
+        }
+    }
+    
+    if (-not $downloaded) {
+        throw "所有 PuTTY 备用源均不可访问，无法绕开 Chocolatey 完成安装"
+    }
+    
+    # 加入当前进程 PATH
+    if ($env:Path -notlike "*$destDir*") {
+        $env:Path = "$destDir;$env:Path"
+    }
+    
+    # 持久化到用户 PATH
+    try {
+        $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+        if ($userPath -notlike "*$destDir*") {
+            $newUserPath = if ($userPath) { "$destDir;$userPath" } else { $destDir }
+            [System.Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+            Write-Ok "已把 $destDir 添加到用户 PATH（重启终端后永久生效）"
+        }
+    } catch {
+        Write-Warn "永久化 PATH 失败：$($_.Exception.Message)（本进程内仍可用）"
+    }
+    
+    Write-Ok "PuTTY plink.exe 下载安装成功：$plinkDest"
+    return $plinkDest
+}
+
 function Check-Dependencies {
     Write-Step "检查本地依赖"
     
@@ -671,47 +835,65 @@ function Check-Dependencies {
         Write-Hint "  - 或安装 sshpass（备选）: choco install sshpass -y"
         
         if ((Test-Command "choco") -and (Confirm "是否立即通过 Chocolatey 安装 PuTTY（推荐）？" "Y")) {
+            $installedViaChoco = $false
             try {
-                # 首选 putty.portable（更小更快，plink 直接放在 lib\putty.portable\tools\）
-                Write-Info "正在执行: choco install putty.portable -y"
-                $chocoOutput = & choco install putty.portable -y --no-progress 2>&1
-                $chocoOutput | ForEach-Object { Write-Host "   ↳ $_" -ForegroundColor DarkGray }
-                $chocoExitCode = $LASTEXITCODE
+                # 使用包含自动重试的包装器（应对 503/超时等临时性网络错误）
+                $result = Invoke-ChocoInstallWithRetry -PackageName "putty.portable" -MaxRetries 4 -InitialDelaySec 3
                 
-                # 严格校验：choco 可能返回 0 但实际是 "installed 0/0 packages"
-                $outputText = ($chocoOutput | Out-String)
-                if ($outputText -match "installed 0/0 packages" -or $outputText -match "is not a valid nupkg file") {
-                    throw "Chocolatey 包索引损坏，实际未安装任何包；请重启脚本以触发 choco 自检修复"
-                }
-                if ($chocoExitCode -ne 0) {
-                    throw "choco install 返回非零退出码：$chocoExitCode"
-                }
-                
-                # 刷新 PATH（合并 Machine+User，去重避免过长）
-                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-                
-                # 主动把 choco bin 加到当前进程 PATH（shim 通常刚生成还没被加载）
-                $chocoBin = "$env:ProgramData\chocolatey\bin"
-                if ((Test-Path $chocoBin) -and ($env:Path -notlike "*$chocoBin*")) {
-                    $env:Path = "$chocoBin;$env:Path"
-                }
-                
-                $plinkPath = Get-PlinkPath
-                if ($plinkPath) {
-                    Write-Ok "PuTTY 安装成功：$plinkPath"
-                    # 把 plink 所在目录加入当前进程 PATH，后续 Get-Command 也能找到
-                    $plinkDir = Split-Path -Parent $plinkPath
-                    if ($plinkDir -and ($env:Path -notlike "*$plinkDir*")) {
-                        $env:Path = "$plinkDir;$env:Path"
+                if ($result.Success) {
+                    $installedViaChoco = $true
+                    # 刷新 PATH（合并 Machine+User，去重避免过长）
+                    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                    
+                    # 主动把 choco bin 加到当前进程 PATH（shim 通常刚生成还没被加载）
+                    $chocoBin = "$env:ProgramData\chocolatey\bin"
+                    if ((Test-Path $chocoBin) -and ($env:Path -notlike "*$chocoBin*")) {
+                        $env:Path = "$chocoBin;$env:Path"
+                    }
+                    
+                    $plinkPath = Get-PlinkPath
+                    if ($plinkPath) {
+                        Write-Ok "PuTTY 安装成功：$plinkPath"
+                        $plinkDir = Split-Path -Parent $plinkPath
+                        if ($plinkDir -and ($env:Path -notlike "*$plinkDir*")) {
+                            $env:Path = "$plinkDir;$env:Path"
+                        }
+                    } else {
+                        Write-Warn "choco 报安装成功但 plink.exe 未找到，将尝试备用方案"
+                        $installedViaChoco = $false
                     }
                 } else {
-                    throw "choco install 已执行，但 plink.exe 在所有已知位置均未找到"
+                    # 区分不同失败类型，给出精准提示
+                    if ($result.IsChocoBroken) {
+                        Write-Err "Chocolatey 包索引损坏（请重启脚本触发 choco 自检修复）"
+                    } elseif ($result.IsNetworkError) {
+                        Write-Warn "Chocolatey 源在重试 $($result.Attempts) 次后仍不可访问（常见于 503/网络抖动）"
+                        Write-Hint "将尝试从官方备用源直接下载 PuTTY"
+                    } else {
+                        Write-Err "PuTTY 安装失败（重试 $($result.Attempts) 次）"
+                    }
                 }
             } catch {
-                Write-Err "PuTTY 安装失败：$($_.Exception.Message)"
-                Write-Hint "建议手动执行：choco install putty.portable -y"
-                Write-Hint "或使用 MSI 官方安装: https://www.chuiwi.com/putty/"
-                throw "前置依赖 plink.exe 未就绪，无法继续"
+                Write-Warn "choco install 流程异常：$($_.Exception.Message)"
+            }
+            
+            # ---- Fallback：GitHub / 官方备用源直接下载 plink.exe ----
+            if (-not $installedViaChoco) {
+                try {
+                    $fallbackPlink = Install-PuTTYFromFallback
+                    $plinkPath = Get-PlinkPath
+                    if (-not $plinkPath) { $plinkPath = $fallbackPlink }
+                    if ($plinkPath) {
+                        Write-Ok "已通过备用方案安装 plink.exe：$plinkPath"
+                    } else {
+                        throw "备用方案完成但 plink.exe 仍无法定位"
+                    }
+                } catch {
+                    Write-Err "备用安装方案也失败：$($_.Exception.Message)"
+                    Write-Hint "昤后可手动下载：https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe"
+                    Write-Hint "下载后放到任意目录，并把该目录加入 PATH。"
+                    throw "前置依赖 plink.exe 未就绪，无法继续"
+                }
             }
         } else {
             # 用户拒绝安装 PuTTY，且也没有 sshpass → 无法继续
