@@ -401,18 +401,12 @@ function Install-Chocolatey {
         # Chocolatey 稳定版本（可按需升级；GitHub Release 是真实存储位置）
         $chocoVersion = "2.7.1"
         
-        # 候选镜像源（按优先级排序）：
-        #   GitHub 代理 1 → GitHub 代理 2 → GitHub 代理 3 → GitHub 官方 → Chocolatey 官方源
-        # 说明：Chocolatey 的 nupkg 实际存放在 GitHub Release，
-        #       国内走 ghproxy 系列反代通常比官方 community.chocolatey.org 快得多
+        # 候选镜像源（按优先级排序，基于实测可靠性）：
+        #   ghfast.top → gh-proxy.com → mirror.ghproxy.com → GitHub 直连 → 官方源
+        # 说明：Chocolatey 的 nupkg 真实存放在 GitHub Release，走 GitHub 反代比官方源更快
         $githubReleasePath = "chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg"
         
         $mirrors = @(
-            @{
-                Name = "ghproxy.link 代理"
-                PackageUrl = "https://ghproxy.link/https://github.com/$githubReleasePath"
-                InstallScriptUrl = $null
-            },
             @{
                 Name = "ghfast.top 代理"
                 PackageUrl = "https://ghfast.top/https://github.com/$githubReleasePath"
@@ -421,6 +415,11 @@ function Install-Chocolatey {
             @{
                 Name = "gh-proxy.com 代理"
                 PackageUrl = "https://gh-proxy.com/https://github.com/$githubReleasePath"
+                InstallScriptUrl = $null
+            },
+            @{
+                Name = "mirror.ghproxy.com 代理"
+                PackageUrl = "https://mirror.ghproxy.com/https://github.com/$githubReleasePath"
                 InstallScriptUrl = $null
             },
             @{
@@ -564,8 +563,9 @@ function Install-Chocolatey {
             Write-Host " 请手动下载 Chocolatey 安装包（任选一种方式）：" -ForegroundColor Yellow
             Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Yellow
             Write-Host " 方式 A：用浏览器打开以下任一链接，下载 chocolatey.$chocoVersion.nupkg：" -ForegroundColor White
-            Write-Host "   1. https://ghproxy.link/https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg" -ForegroundColor Cyan
-            Write-Host "   2. https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg" -ForegroundColor Cyan
+            Write-Host "   1. https://ghfast.top/https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg" -ForegroundColor Cyan
+            Write-Host "   2. https://gh-proxy.com/https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg" -ForegroundColor Cyan
+            Write-Host "   3. https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg" -ForegroundColor Cyan
             Write-Host ""
             Write-Host " 方式 B：从其他能联网的机器下载后通过 U 盘/网络共享传过来" -ForegroundColor White
             Write-Host ""
@@ -611,12 +611,19 @@ function Install-ChocolateyFromNupkg {
         throw "找不到 nupkg 文件：$NupkgPath"
     }
     
+    # 二次确认管理员权限（不能靠 chocolateyInstall.ps1 自己检查，它会 throw 中断流程）
+    if (-not (Test-IsAdministrator)) {
+        throw "需要管理员权限才能安装 Chocolatey 到 $env:ProgramData\chocolatey，请以管理员身份重新运行 PowerShell"
+    }
+    
     $chocoInstallRoot = Join-Path $env:ProgramData "chocolatey"
     $extractTmp = Join-Path $env:TEMP "obsidian-sync-choco-extract"
     
-    # 清理旧的临时解压目录
+    # 每次调用都强制清理旧的临时目录（关键：防止上一轮失败残留导致 ZipFile.ExtractToDirectory 报"文件已存在"）
     if (Test-Path $extractTmp) {
         Remove-Item -Path $extractTmp -Recurse -Force -ErrorAction SilentlyContinue
+        # 等待文件系统释放句柄
+        Start-Sleep -Milliseconds 200
     }
     New-Item -ItemType Directory -Path $extractTmp -Force | Out-Null
     
@@ -631,41 +638,116 @@ function Install-ChocolateyFromNupkg {
             New-Item -ItemType Directory -Path $chocoInstallRoot -Force | Out-Null
         }
         
-        # 查找 tools\chocolateyInstall\chocolateyInstall.ps1（Chocolatey 2.x 结构）
-        # 或 tools\chocolateyInstall.ps1（1.x 结构）
         $toolsDir = Join-Path $extractTmp "tools"
         if (-not (Test-Path $toolsDir)) {
             throw "nupkg 中未找到 tools 目录，包结构异常"
         }
         
-        $chocoInstallScript = Get-ChildItem -Path $toolsDir -Filter "chocolateyInstall.ps1" -Recurse | Select-Object -First 1
-        if (-not $chocoInstallScript) {
-            # 没有自带的 install 脚本，直接把 tools 目录复制为 chocolatey 主程序
-            Write-Host "   ↳ 未找到 chocolateyInstall.ps1，采用直接复制方式..." -ForegroundColor DarkGray
-            Copy-Item -Path "$toolsDir\*" -Destination $chocoInstallRoot -Recurse -Force
+        # 直接采用"文件复制"方式部署，完全不执行 chocolateyInstall.ps1
+        # 原因：Chocolatey 2.x 自带的 chocolateyInstall.ps1 会重复检查管理员身份、
+        #       设置各种复杂环境变量，任一步出错都会中断；对我们而言只需要 choco.exe 可用即可
+        Write-Host "   ↳ 部署 Chocolatey 文件到 $chocoInstallRoot ..." -ForegroundColor DarkGray
+        
+        # 复制 tools 目录下的所有内容到 chocolatey 根目录
+        # tools 下结构通常为：tools/chocolateyInstall/{choco.exe, helpers/, redirects/, ...}
+        $innerInstallDir = Join-Path $toolsDir "chocolateyInstall"
+        if (Test-Path $innerInstallDir) {
+            # Chocolatey 2.x 结构：tools/chocolateyInstall/ 是真正的安装根
+            Copy-Item -Path "$innerInstallDir\*" -Destination $chocoInstallRoot -Recurse -Force
         } else {
-            Write-Host "   ↳ 执行 chocolateyInstall.ps1 完成部署..." -ForegroundColor DarkGray
-            # 设置必要的环境变量，让 chocoInstallScript 知道目标目录
-            $env:ChocolateyInstall = $chocoInstallRoot
-            & $chocoInstallScript.FullName
+            # 兼容：直接把 tools 下所有内容复制过去
+            Copy-Item -Path "$toolsDir\*" -Destination $chocoInstallRoot -Recurse -Force
         }
         
-        # 注册 PATH（系统级）
-        $chocoBinDir = Join-Path $chocoInstallRoot "bin"
-        if (Test-Path $chocoBinDir) {
-            $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-            if ($machinePath -notlike "*$chocoBinDir*") {
-                Write-Host "   ↳ 注册 $chocoBinDir 到系统 PATH..." -ForegroundColor DarkGray
-                [System.Environment]::SetEnvironmentVariable("Path", "$machinePath;$chocoBinDir", "Machine")
+        # 校验核心可执行文件
+        $chocoExe = Join-Path $chocoInstallRoot "choco.exe"
+        if (-not (Test-Path $chocoExe)) {
+            # 某些包 choco.exe 在 bin 子目录
+            $chocoExeAlt = Join-Path $chocoInstallRoot "bin\choco.exe"
+            if (Test-Path $chocoExeAlt) {
+                $chocoExe = $chocoExeAlt
+            } else {
+                throw "部署完成但未找到 choco.exe，请检查 nupkg 结构"
             }
-            [System.Environment]::SetEnvironmentVariable("ChocolateyInstall", $chocoInstallRoot, "Machine")
         }
         
-        Write-Host "   ↳ Chocolatey 文件已部署到 $chocoInstallRoot" -ForegroundColor DarkGray
+        # 确保 bin 目录存在（用作 PATH 注册点），choco.exe 需要出现在 PATH 中
+        $chocoBinDir = Join-Path $chocoInstallRoot "bin"
+        if (-not (Test-Path $chocoBinDir)) {
+            New-Item -ItemType Directory -Path $chocoBinDir -Force | Out-Null
+        }
+        # 若 choco.exe 在根目录，则在 bin 下做一个拷贝（Chocolatey 官方行为也是如此）
+        $binChoco = Join-Path $chocoBinDir "choco.exe"
+        if (-not (Test-Path $binChoco)) {
+            Copy-Item -Path $chocoExe -Destination $binChoco -Force
+        }
+        
+        # 注册系统级环境变量（管理员权限下写 Machine）
+        Write-Host "   ↳ 注册系统 PATH 与 ChocolateyInstall 环境变量..." -ForegroundColor DarkGray
+        [System.Environment]::SetEnvironmentVariable("ChocolateyInstall", $chocoInstallRoot, "Machine")
+        
+        $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+        if ($machinePath -notlike "*$chocoBinDir*") {
+            [System.Environment]::SetEnvironmentVariable("Path", "$machinePath;$chocoBinDir", "Machine")
+        }
+        
+        # 同时刷新当前进程环境，避免需要重启终端
+        $env:ChocolateyInstall = $chocoInstallRoot
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        
+        Write-Host "   ↳ Chocolatey 已部署到 $chocoInstallRoot" -ForegroundColor DarkGray
     } finally {
         # 清理临时解压目录
         Remove-Item -Path $extractTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+# ---------------------------------------------------------------------------
+# 管理员权限检查与自动提权
+# ---------------------------------------------------------------------------
+function Test-IsAdministrator {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Request-AdminElevation {
+    if (Test-IsAdministrator) { return $true }
+    
+    Write-Warn "当前不是管理员身份运行，Chocolatey 安装需要管理员权限"
+    Write-Host ""
+    Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+    Write-Host " 选项：" -ForegroundColor Yellow
+    Write-Host "   1) 自动以管理员身份重新启动本脚本（推荐）" -ForegroundColor White
+    Write-Host "   2) 手动退出，自行右键 PowerShell -> 以管理员身份运行后重试" -ForegroundColor White
+    Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+    
+    if (Confirm "是否自动以管理员身份重新启动本脚本？" "Y") {
+        $scriptPath = $MyInvocation.PSCommandPath
+        if (-not $scriptPath) { $scriptPath = $PSCommandPath }
+        if (-not $scriptPath) {
+            # 在某些交互式执行中 $PSCommandPath 可能为空，从脚本根变量获取
+            $scriptPath = (Get-Variable -Name MyInvocation -Scope Script -ErrorAction SilentlyContinue).Value.MyCommand.Path
+        }
+        
+        if ($scriptPath -and (Test-Path $scriptPath)) {
+            Write-Info "正在以管理员身份启动：$scriptPath"
+            try {
+                Start-Process -FilePath "powershell.exe" `
+                    -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$scriptPath`"" `
+                    -Verb RunAs
+                Write-Ok "已启动管理员窗口，当前窗口将退出"
+                exit 0
+            } catch {
+                Write-Error "UAC 提权被拒绝或失败：$($_.Exception.Message)"
+                return $false
+            }
+        } else {
+            Write-Error "无法定位脚本路径，请手动以管理员身份重新运行"
+            return $false
+        }
+    }
+    return $false
 }
 
 function Set-ChocolateyMirror {
@@ -841,10 +923,19 @@ function Main {
         Write-Host "=== Obsidian 同步工具 (Windows 版本) ===" -ForegroundColor Cyan
         Write-Host "版本: $SCRIPT_VERSION" -ForegroundColor Gray
         Write-Host "操作系统: Windows $( [System.Environment]::OSVersion.Version )" -ForegroundColor Gray
+        $adminMark = if (Test-IsAdministrator) { "[管理员]" } else { "[普通用户]" }
+        Write-Host "运行身份: $adminMark" -ForegroundColor Gray
         Write-Host ""
         
         # 编码检测与修复（解决远程桌面乱码问题）
         Test-AndFix-Encoding
+        
+        # 管理员权限检查（安装 Chocolatey / Windows 服务需要管理员）
+        if (-not (Test-IsAdministrator)) {
+            if (-not (Request-AdminElevation)) {
+                throw "需要管理员权限才能继续，请以管理员身份重新运行脚本"
+            }
+        }
         
         # 创建状态目录
         if (-not (Test-Path $STATE_DIR)) {
