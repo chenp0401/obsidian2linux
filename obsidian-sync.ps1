@@ -297,7 +297,7 @@ function Check-Dependencies {
 }
 
 function Install-Chocolatey {
-    Write-Step "安装 Chocolatey 包管理器"
+    Write-Step "安装 Chocolatey 包管理器（使用国内镜像加速）"
     
     try {
         # 检查 PowerShell 执行策略
@@ -307,21 +307,110 @@ function Install-Chocolatey {
             Set-ExecutionPolicy Bypass -Scope Process -Force
         }
         
-        # 安装 Chocolatey
-        Write-Info "正在安装 Chocolatey..."
-        Invoke-Expression "Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))"
+        # 启用 TLS 1.2
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
         
-        # 刷新环境变量
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        # 候选镜像源（按优先级排序）：华为云 → 腾讯云 → 清华大学 → 官方源
+        $mirrors = @(
+            @{
+                Name = "华为云"
+                PackageUrl = "https://mirrors.huaweicloud.com/chocolatey/chocolatey.0.10.15.nupkg"
+                InstallScriptUrl = $null
+            },
+            @{
+                Name = "腾讯云"
+                PackageUrl = "https://mirrors.cloud.tencent.com/chocolatey/chocolatey.0.10.15.nupkg"
+                InstallScriptUrl = $null
+            },
+            @{
+                Name = "清华大学"
+                PackageUrl = "https://mirrors.tuna.tsinghua.edu.cn/chocolatey/chocolatey.nupkg"
+                InstallScriptUrl = $null
+            },
+            @{
+                Name = "官方源"
+                PackageUrl = $null
+                InstallScriptUrl = "https://community.chocolatey.org/install.ps1"
+            }
+        )
         
-        if (Test-Command "choco") {
-            Write-Ok "Chocolatey 安装成功"
-        } else {
-            throw "Chocolatey 安装后未检测到，可能需要重启 PowerShell"
+        $installed = $false
+        foreach ($mirror in $mirrors) {
+            Write-Info "尝试使用镜像：$($mirror.Name)"
+            try {
+                if ($mirror.PackageUrl) {
+                    # 通过环境变量指定 nupkg 下载地址，让官方脚本从镜像拉包
+                    $env:chocolateyDownloadUrl = $mirror.PackageUrl
+                    $env:chocolateyVersion = ""
+                }
+                
+                $scriptUrl = if ($mirror.InstallScriptUrl) { $mirror.InstallScriptUrl } else { "https://community.chocolatey.org/install.ps1" }
+                
+                # 设置下载超时（30秒）
+                $webClient = New-Object System.Net.WebClient
+                $webClient.Headers.Add("User-Agent", "PowerShell")
+                $installScript = $webClient.DownloadString($scriptUrl)
+                
+                Write-Info "从 $($mirror.Name) 下载安装包并执行..."
+                Invoke-Expression $installScript
+                
+                # 刷新环境变量
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                
+                if (Test-Command "choco") {
+                    Write-Ok "Chocolatey 安装成功（使用 $($mirror.Name) 镜像）"
+                    $installed = $true
+                    break
+                }
+            } catch {
+                Write-Warn "使用 $($mirror.Name) 镜像安装失败：$($_.Exception.Message)"
+                continue
+            } finally {
+                # 清理环境变量
+                Remove-Item Env:\chocolateyDownloadUrl -ErrorAction SilentlyContinue
+                Remove-Item Env:\chocolateyVersion -ErrorAction SilentlyContinue
+            }
         }
+        
+        if (-not $installed) {
+            throw "所有镜像源均安装失败，请检查网络或手动安装 Chocolatey"
+        }
+        
+        # 安装成功后，配置 Chocolatey 使用国内镜像作为默认源
+        Set-ChocolateyMirror
         
     } catch {
         throw "Chocolatey 安装失败: $($_.Exception.Message)"
+    }
+}
+
+function Set-ChocolateyMirror {
+    Write-Step "配置 Chocolatey 使用国内镜像源"
+    
+    try {
+        # 添加华为云镜像源（优先级最高）
+        $huaweiSource = "https://mirrors.huaweicloud.com/repository/nuget/v3/index.json"
+        
+        # 查看现有源
+        $existingSources = choco source list 2>&1 | Out-String
+        
+        if ($existingSources -notmatch "huaweicloud") {
+            Write-Info "添加华为云镜像源..."
+            choco source add -n="huaweicloud" -s="$huaweiSource" --priority=1 | Out-Null
+            Write-Ok "已添加华为云镜像源（优先级 1）"
+        } else {
+            Write-Ok "华为云镜像源已存在"
+        }
+        
+        # 禁用官方源（可选，加速后续安装）
+        if (Confirm "是否禁用 Chocolatey 官方源以强制使用国内镜像？（推荐）" "Y") {
+            choco source disable -n="chocolatey" 2>&1 | Out-Null
+            Write-Ok "已禁用 Chocolatey 官方源"
+        }
+        
+    } catch {
+        Write-Warn "配置镜像源失败：$($_.Exception.Message)"
+        Write-Hint "可稍后手动执行：choco source add -n=huaweicloud -s=https://mirrors.huaweicloud.com/repository/nuget/v3/index.json --priority=1"
     }
 }
 
