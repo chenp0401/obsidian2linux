@@ -65,8 +65,7 @@ function Write-Log {
         "WARN" = "⚠";
         "ERR"  = "✘";
         "STEP" = "▶"
-    }
-    
+    }    
     $symbol = $symbols[$Level]
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     
@@ -125,7 +124,6 @@ function Read-Password {
     )
     return $password
 }
-
 # ---------------------------------------------------------------------------
 # 模块：依赖检查
 # ---------------------------------------------------------------------------
