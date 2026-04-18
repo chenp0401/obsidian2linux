@@ -218,8 +218,16 @@ function Read-WithDefault {
     )
     
     Write-Host "$Prompt [默认: $Default]: " -NoNewline -ForegroundColor Magenta
-    $input = Read-Host
-    return if ([string]::IsNullOrEmpty($input)) { $Default } else { $input }
+    # 注意：不要使用 $input 作为变量名，它是 PowerShell 自动变量（代表管道输入）
+    $userInput = Read-Host
+    # 注意：不要写 `return if (...) {...} else {...}`，
+    #   PowerShell 解析器会把 if 当作独立语句而非 return 的表达式，
+    #   导致报错 "The term 'if' is not recognized as a name of a cmdlet..."
+    if ([string]::IsNullOrEmpty($userInput)) {
+        return $Default
+    } else {
+        return $userInput
+    }
 }
 
 function Read-Password {
@@ -897,7 +905,12 @@ function Get-WindowsCredential {
     
     try {
         $cred = Get-StoredCredential -Target $Target -ErrorAction SilentlyContinue
-        return if ($cred) { $cred.GetNetworkCredential().Password } else { $null }
+        # 不要写 `return if (...) {...} else {...}`，PowerShell 会把 if 当独立语句报错
+        if ($cred) {
+            return $cred.GetNetworkCredential().Password
+        } else {
+            return $null
+        }
     } catch {
         return $null
     }
