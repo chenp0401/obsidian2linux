@@ -264,6 +264,95 @@ function Test-Command {
     return Get-Command $Command -ErrorAction SilentlyContinue
 }
 
+# ---------------------------------------------------------------------------
+# 检测 Chocolatey 安装是否完整（自修复早期版本用"解压复制法"部署时漏掉的文件）
+# 判定"损坏"的信号：
+#   - C:\ProgramData\chocolatey\lib\chocolatey\chocolatey.nupkg 不存在
+#   - choco install 返回 "installed 0/0 packages" 但没有真实报错
+# 损坏时尝试补齐缺失的 nupkg 文件，避免所有后续 choco install 全部静默失败
+# ---------------------------------------------------------------------------
+function Test-ChocolateyHealth {
+    if (-not (Test-Command "choco")) { return $true }  # 未安装就不检测
+    
+    $chocoRoot = $env:ChocolateyInstall
+    if (-not $chocoRoot) { $chocoRoot = "$env:ProgramData\chocolatey" }
+    
+    $libSelfNupkg = Join-Path $chocoRoot "lib\chocolatey\chocolatey.nupkg"
+    if (-not (Test-Path $libSelfNupkg)) {
+        return $false
+    }
+    
+    # 额外校验：nupkg 文件必须是合法 zip（前两字节 PK）
+    try {
+        $fs = [System.IO.File]::OpenRead($libSelfNupkg)
+        $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte()
+        $fs.Close()
+        if ($b0 -ne 0x50 -or $b1 -ne 0x4B) { return $false }
+    } catch {
+        return $false
+    }
+    
+    return $true
+}
+
+function Repair-Chocolatey {
+    Write-Step "修复 Chocolatey 安装"
+    
+    if (-not (Test-IsAdministrator)) {
+        throw "修复 Chocolatey 需要管理员权限"
+    }
+    
+    $chocoRoot = $env:ChocolateyInstall
+    if (-not $chocoRoot) { $chocoRoot = "$env:ProgramData\chocolatey" }
+    
+    Write-Info "检测到 Chocolatey 包索引损坏（缺失 lib\chocolatey\chocolatey.nupkg）"
+    Write-Info "将重新下载并补齐缺失文件..."
+    
+    # 复用 Install-Chocolatey 的下载逻辑：尝试从镜像下载 nupkg
+    $chocoVersion = "2.7.1"
+    $tmpDir = Join-Path $env:TEMP "obsidian-sync-choco-repair"
+    if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+    
+    $mirrors = @(
+        "https://ghfast.top/https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg",
+        "https://gh-proxy.com/https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg",
+        "https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg"
+    )
+    
+    $localNupkg = Join-Path $tmpDir "chocolatey.nupkg"
+    $downloaded = $false
+    foreach ($url in $mirrors) {
+        try {
+            Write-Info "尝试下载: $url"
+            Invoke-DownloadWithProgress -Url $url -OutFile $localNupkg -TimeoutSec 60 -Activity "下载 Chocolatey nupkg（修复）"
+            $bytes = [System.IO.File]::ReadAllBytes($localNupkg)
+            if ($bytes.Length -gt 1024 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B) {
+                $downloaded = $true
+                break
+            }
+        } catch {
+            Write-Warn "下载失败: $($_.Exception.Message)"
+        }
+    }
+    
+    if (-not $downloaded) {
+        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        throw "无法下载 Chocolatey nupkg 用于修复，请检查网络"
+    }
+    
+    # 补齐 lib\chocolatey\chocolatey.nupkg
+    $libSelfDir = Join-Path $chocoRoot "lib\chocolatey"
+    if (-not (Test-Path $libSelfDir)) {
+        New-Item -ItemType Directory -Path $libSelfDir -Force | Out-Null
+    }
+    $libSelfNupkg = Join-Path $libSelfDir "chocolatey.nupkg"
+    Copy-Item -Path $localNupkg -Destination $libSelfNupkg -Force
+    Write-Ok "已补齐 choco 包索引: $libSelfNupkg"
+    
+    Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 function Check-Dependencies {
     Write-Step "检查本地依赖"
     
@@ -274,7 +363,18 @@ function Check-Dependencies {
             Install-Chocolatey
         }
     } else {
-        Write-Ok "已安装：Chocolatey 包管理器"
+        # 自检：验证 choco 安装是否完整，早期解压部署可能漏掉 lib\chocolatey\chocolatey.nupkg
+        if (-not (Test-ChocolateyHealth)) {
+            Write-Warn "检测到 Chocolatey 安装不完整（lib\chocolatey\chocolatey.nupkg 缺失或损坏）"
+            Write-Hint "这会导致 choco install 静默失败（Chocolatey installed 0/0 packages）"
+            if (Confirm "是否立即修复？" "Y") {
+                Repair-Chocolatey
+            } else {
+                throw "Chocolatey 已损坏，无法继续；请选择修复或手动卸载重装"
+            }
+        } else {
+            Write-Ok "已安装：Chocolatey 包管理器"
+        }
     }
     
     $required = @("ssh", "curl")
@@ -319,19 +419,57 @@ function Check-Dependencies {
         
         if ((Test-Command "choco") -and (Confirm "是否立即通过 Chocolatey 安装 PuTTY（推荐）？" "Y")) {
             try {
-                choco install putty -y --no-progress | Out-Null
-                # 刷新 PATH
+                # 首选 putty.portable（更小更快，plink 直接放在 lib\putty.portable\tools\）
+                Write-Info "正在执行: choco install putty.portable -y"
+                $chocoOutput = & choco install putty.portable -y --no-progress 2>&1
+                $chocoOutput | ForEach-Object { Write-Host "   ↳ $_" -ForegroundColor DarkGray }
+                $chocoExitCode = $LASTEXITCODE
+                
+                # 严格校验：choco 可能返回 0 但实际是 "installed 0/0 packages"
+                $outputText = ($chocoOutput | Out-String)
+                if ($outputText -match "installed 0/0 packages" -or $outputText -match "is not a valid nupkg file") {
+                    throw "Chocolatey 包索引损坏，实际未安装任何包；请重启脚本以触发 choco 自检修复"
+                }
+                if ($chocoExitCode -ne 0) {
+                    throw "choco install 返回非零退出码：$chocoExitCode"
+                }
+                
+                # 刷新 PATH（合并 Machine+User，去重避免过长）
                 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                
+                # 主动把 choco bin 加到当前进程 PATH（shim 通常刚生成还没被加载）
+                $chocoBin = "$env:ProgramData\chocolatey\bin"
+                if ((Test-Path $chocoBin) -and ($env:Path -notlike "*$chocoBin*")) {
+                    $env:Path = "$chocoBin;$env:Path"
+                }
+                
                 $plinkPath = Get-PlinkPath
                 if ($plinkPath) {
                     Write-Ok "PuTTY 安装成功：$plinkPath"
+                    # 把 plink 所在目录加入当前进程 PATH，后续 Get-Command 也能找到
+                    $plinkDir = Split-Path -Parent $plinkPath
+                    if ($plinkDir -and ($env:Path -notlike "*$plinkDir*")) {
+                        $env:Path = "$plinkDir;$env:Path"
+                    }
                 } else {
-                    Write-Warn "PuTTY 安装命令已执行，但未检测到 plink.exe，可能需要重启终端"
+                    throw "choco install 已执行，但 plink.exe 在所有已知位置均未找到"
                 }
             } catch {
-                Write-Warn "PuTTY 安装失败：$($_.Exception.Message)"
+                Write-Err "PuTTY 安装失败：$($_.Exception.Message)"
+                Write-Hint "建议手动执行：choco install putty.portable -y"
+                Write-Hint "或使用 MSI 官方安装: https://www.chuiwi.com/putty/"
+                throw "前置依赖 plink.exe 未就绪，无法继续"
             }
+        } else {
+            # 用户拒绝安装 PuTTY，且也没有 sshpass → 无法继续
+            throw "前置依赖缺失：需要 plink.exe（PuTTY）或 sshpass 之一才能进行非交互式 SSH 登录"
         }
+    }
+    
+    # ---- 前置依赖最终硬校验：任一 SSH 客户端必须存在，否则立即中止 ----
+    $finalPlink = Get-PlinkPath
+    if ((-not $finalPlink) -and (-not (Test-Command "sshpass"))) {
+        throw "前置依赖检查未通过：plink.exe 与 sshpass 均不可用，无法进行非交互式 SSH 登录"
     }
     
     foreach ($item in $optional) {
@@ -733,6 +871,17 @@ function Install-ChocolateyFromNupkg {
             Copy-Item -Path $chocoExe -Destination $binChoco -Force
         }
         
+        # ---- 关键修复：补齐 choco 包索引 ----
+        # choco install 时会读取 lib\chocolatey\chocolatey.nupkg 校验自身包信息，
+        # 若缺失则安装任何包都会出现 "Chocolatey installed 0/0 packages" 的静默失败
+        $libSelfDir = Join-Path $chocoInstallRoot "lib\chocolatey"
+        if (-not (Test-Path $libSelfDir)) {
+            New-Item -ItemType Directory -Path $libSelfDir -Force | Out-Null
+        }
+        $libSelfNupkg = Join-Path $libSelfDir "chocolatey.nupkg"
+        Copy-Item -Path $NupkgPath -Destination $libSelfNupkg -Force
+        Write-Host "   ↳ 已补齐 choco 自身包索引: $libSelfNupkg" -ForegroundColor DarkGray
+        
         # 注册系统级环境变量（管理员权限下写 Machine）
         Write-Host "   ↳ 注册系统 PATH 与 ChocolateyInstall 环境变量..." -ForegroundColor DarkGray
         [System.Environment]::SetEnvironmentVariable("ChocolateyInstall", $chocoInstallRoot, "Machine")
@@ -923,22 +1072,46 @@ function Convert-ToUnixPath {
 #   - 所有命令行都把 stderr 重定向到 stdout（2>&1），便于上层捕获错误信息。
 # ---------------------------------------------------------------------------
 
-# 查找 plink.exe 的绝对路径（choco 安装后一般在 C:\Program Files\PuTTY\plink.exe）
+# 查找 plink.exe 的绝对路径
+# Chocolatey 安装 PuTTY 后的常见位置（choco 会装 putty.portable，plink 在 lib 下）：
+#   - C:\Program Files\PuTTY\plink.exe                              （官方 MSI 安装）
+#   - C:\ProgramData\chocolatey\bin\plink.exe                       （choco shim）
+#   - C:\ProgramData\chocolatey\lib\putty.portable\tools\plink.exe  （choco portable）
+#   - C:\ProgramData\chocolatey\lib\putty\tools\plink.exe           （choco putty 元包）
 function Get-PlinkPath {
-    # 1) 优先使用 PATH 中的 plink
+    # 1) 优先使用 PATH 中的 plink（最快）
     $cmd = Get-Command "plink.exe" -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
     
-    # 2) 尝试常见安装位置
+    # 2) 尝试所有已知的静态路径
     $candidates = @(
         "$env:ProgramFiles\PuTTY\plink.exe",
         "${env:ProgramFiles(x86)}\PuTTY\plink.exe",
         "$env:ChocolateyInstall\bin\plink.exe",
-        "$env:ProgramData\chocolatey\bin\plink.exe"
+        "$env:ProgramData\chocolatey\bin\plink.exe",
+        "$env:ProgramData\chocolatey\lib\putty.portable\tools\plink.exe",
+        "$env:ProgramData\chocolatey\lib\putty\tools\plink.exe",
+        "$env:ChocolateyInstall\lib\putty.portable\tools\plink.exe",
+        "$env:ChocolateyInstall\lib\putty\tools\plink.exe"
     )
     foreach ($p in $candidates) {
         if ($p -and (Test-Path $p)) { return $p }
     }
+    
+    # 3) 兜底：递归扫描 choco 的 lib 目录（刚装完 putty，choco shim 还没生成时的场景）
+    $chocoLibDirs = @(
+        "$env:ProgramData\chocolatey\lib",
+        "$env:ChocolateyInstall\lib"
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+    
+    foreach ($libDir in $chocoLibDirs) {
+        try {
+            $found = Get-ChildItem -Path $libDir -Filter "plink.exe" -Recurse -ErrorAction SilentlyContinue -Force | 
+                Select-Object -First 1
+            if ($found) { return $found.FullName }
+        } catch { }
+    }
+    
     return $null
 }
 
