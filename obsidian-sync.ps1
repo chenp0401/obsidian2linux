@@ -295,6 +295,190 @@ function Test-ChocolateyHealth {
     return $true
 }
 
+# ---------------------------------------------------------------------------
+# 在常见位置搜索已存在的 chocolatey nupkg（上一次安装残留、用户手动下载等）
+# 命中即可完全跳过下载，修复滑滞前退到 0 秒
+# ---------------------------------------------------------------------------
+function Find-LocalChocolateyNupkg {
+    param([string]$Version = "2.7.1")
+    
+    $candidates = @(
+        # 本脚本上一次安装时的临时下载
+        "$env:TEMP\obsidian-sync-choco\chocolatey.nupkg",
+        "$env:TEMP\obsidian-sync-choco-repair\chocolatey.nupkg",
+        # choco 官方安装时自己的临时包（无论新老版本都可能在）
+        "$env:TEMP\chocolatey\chocoInstall\chocolatey.zip",
+        "$env:TEMP\chocolatey\chocolatey.nupkg",
+        # 用户的常见下载目录
+        "$env:USERPROFILE\Downloads\chocolatey.$Version.nupkg",
+        "$env:USERPROFILE\Downloads\chocolatey.nupkg",
+        "$env:USERPROFILE\Desktop\chocolatey.$Version.nupkg",
+        "$env:USERPROFILE\Desktop\chocolatey.nupkg"
+    )
+    
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) {
+            try {
+                $fs = [System.IO.File]::OpenRead($p)
+                $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte()
+                $fs.Close()
+                if ($b0 -eq 0x50 -and $b1 -eq 0x4B) {
+                    $size = (Get-Item $p).Length
+                    if ($size -gt 1MB) {
+                        return $p
+                    }
+                }
+            } catch { }
+        }
+    }
+    
+    # 重拳击：将 %USERPROFILE%\Downloads 所有 *.nupkg 扫一遍，找匹配名称的
+    $downloadsDir = Join-Path $env:USERPROFILE "Downloads"
+    if (Test-Path $downloadsDir) {
+        try {
+            $match = Get-ChildItem -Path $downloadsDir -Filter "chocolatey*.nupkg" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -gt 1MB } |
+                Select-Object -First 1
+            if ($match) { return $match.FullName }
+        } catch { }
+    }
+    
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# 多镜像并发下载：所有镜像同时开始下载，首个完成的胜出，其余取消
+# 比串行轮询快几倍，尤其是某些镜像在限速时
+# 返回胜出的本地文件路径，失败时返回 $null
+# ---------------------------------------------------------------------------
+function Invoke-ParallelDownload {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Urls,
+        [Parameter(Mandatory=$true)][string]$OutDir,
+        [Parameter(Mandatory=$true)][string]$FinalOutFile,
+        [int]$TimeoutSec = 120,
+        [int]$MinSizeBytes = 1048576   # 1 MB
+    )
+    
+    if (-not (Test-Path $OutDir)) {
+        New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    }
+    
+    # 为每个 URL 启动一个后台 Job，各自写到独立临时文件
+    $jobs = @()
+    $i = 0
+    foreach ($url in $Urls) {
+        $i++
+        $tmpFile = Join-Path $OutDir "candidate_$i.bin"
+        if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+        
+        $job = Start-Job -ScriptBlock {
+            param($jobUrl, $jobOutFile, $jobTimeout)
+            try {
+                [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11
+                $client = New-Object System.Net.WebClient
+                $client.Headers.Add("User-Agent", "PowerShell/obsidian-sync")
+                # WebClient 没有 Timeout 属性，用异步 + 等待来控制
+                $task = $client.DownloadFileTaskAsync($jobUrl, $jobOutFile)
+                if ($task.Wait([TimeSpan]::FromSeconds($jobTimeout))) {
+                    return @{ Success = $true; File = $jobOutFile; Url = $jobUrl }
+                } else {
+                    $client.CancelAsync()
+                    return @{ Success = $false; Url = $jobUrl; Error = "超时" }
+                }
+            } catch {
+                return @{ Success = $false; Url = $jobUrl; Error = $_.Exception.Message }
+            } finally {
+                if ($client) { $client.Dispose() }
+            }
+        } -ArgumentList $url, $tmpFile, $TimeoutSec
+        
+        $jobs += @{ Job = $job; Url = $url; File = $tmpFile; Index = $i }
+        Write-Host "   ↳ [并发 $i] 已启动: $url" -ForegroundColor DarkGray
+    }
+    
+    # 轮询：监控所有 Job 的临时文件大小 + 状态，首个成功下完合法文件的胜出
+    $winner = $null
+    $startTime = [DateTime]::Now
+    $deadline = $startTime.AddSeconds($TimeoutSec)
+    $lastReport = $startTime
+    
+    while ($null -eq $winner -and [DateTime]::Now -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        
+        # 每 2 秒汇报一次各路进度
+        $now = [DateTime]::Now
+        if (($now - $lastReport).TotalSeconds -ge 2) {
+            $report = @()
+            foreach ($j in $jobs) {
+                $sizeMB = 0
+                if (Test-Path $j.File) {
+                    $sizeMB = [Math]::Round((Get-Item $j.File).Length / 1MB, 2)
+                }
+                $state = $j.Job.State
+                $report += "[$($j.Index)]${sizeMB}MB/$state"
+            }
+            $elapsed = [Math]::Round(($now - $startTime).TotalSeconds, 1)
+            Write-Host "   ↳ 并发进度[${elapsed}s]: $($report -join '  ')" -ForegroundColor DarkGray
+            $lastReport = $now
+        }
+        
+        foreach ($j in $jobs) {
+            if ($j.Job.State -eq "Completed") {
+                # 即使 Job 失败，只要临时文件体积达标且是合法 zip，就认为胜出
+                # 这样可以避开 StrictMode 对 hashtable 缺字段的严格检查
+                Receive-Job -Job $j.Job -ErrorAction SilentlyContinue | Out-Null
+                if (Test-Path $j.File) {
+                    $size = (Get-Item $j.File).Length
+                    if ($size -ge $MinSizeBytes) {
+                        try {
+                            $fs = [System.IO.File]::OpenRead($j.File)
+                            $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte()
+                            $fs.Close()
+                            if ($b0 -eq 0x50 -and $b1 -eq 0x4B) {
+                                $winner = $j
+                                break
+                            }
+                        } catch { }
+                    }
+                }
+            }
+        }
+    }
+    
+    # 停掉所有还在跑的 Job
+    foreach ($j in $jobs) {
+        if ($j.Job.State -eq "Running") {
+            Stop-Job -Job $j.Job -ErrorAction SilentlyContinue
+        }
+        Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue
+    }
+    
+    if ($null -eq $winner) {
+        # 清理所有临时文件
+        foreach ($j in $jobs) {
+            Remove-Item $j.File -Force -ErrorAction SilentlyContinue
+        }
+        return $null
+    }
+    
+    # 胜出者重命名为最终文件，清理其他临时文件
+    if (Test-Path $FinalOutFile) { Remove-Item $FinalOutFile -Force -ErrorAction SilentlyContinue }
+    Move-Item -Path $winner.File -Destination $FinalOutFile -Force
+    foreach ($j in $jobs) {
+        if ($j.Index -ne $winner.Index) {
+            Remove-Item $j.File -Force -ErrorAction SilentlyContinue
+        }
+    }
+    
+    $elapsedTotal = [Math]::Round(([DateTime]::Now - $startTime).TotalSeconds, 1)
+    $sizeMB = [Math]::Round((Get-Item $FinalOutFile).Length / 1MB, 2)
+    Write-Ok "并发下载完成：胜出镜像 [通道 $($winner.Index)]，$sizeMB MB，用时 $elapsedTotal 秒"
+    Write-Hint "胜出 URL: $($winner.Url)"
+    
+    return $FinalOutFile
+}
+
 function Repair-Chocolatey {
     Write-Step "修复 Chocolatey 安装"
     
@@ -306,47 +490,50 @@ function Repair-Chocolatey {
     if (-not $chocoRoot) { $chocoRoot = "$env:ProgramData\chocolatey" }
     
     Write-Info "检测到 Chocolatey 包索引损坏（缺失 lib\chocolatey\chocolatey.nupkg）"
-    Write-Info "将重新下载并补齐缺失文件..."
     
-    # 复用 Install-Chocolatey 的下载逻辑：尝试从镜像下载 nupkg
+    # ---- 优化 1：先尝试从本地复用已有的 nupkg，命中则 0 秒完成 ----
     $chocoVersion = "2.7.1"
-    $tmpDir = Join-Path $env:TEMP "obsidian-sync-choco-repair"
-    if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
-    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-    
-    $mirrors = @(
-        "https://ghfast.top/https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg",
-        "https://gh-proxy.com/https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg",
-        "https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg"
-    )
-    
-    $localNupkg = Join-Path $tmpDir "chocolatey.nupkg"
-    $downloaded = $false
-    foreach ($url in $mirrors) {
-        try {
-            Write-Info "尝试下载: $url"
-            Invoke-DownloadWithProgress -Url $url -OutFile $localNupkg -TimeoutSec 60 -Activity "下载 Chocolatey nupkg（修复）"
-            $bytes = [System.IO.File]::ReadAllBytes($localNupkg)
-            if ($bytes.Length -gt 1024 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B) {
-                $downloaded = $true
-                break
-            }
-        } catch {
-            Write-Warn "下载失败: $($_.Exception.Message)"
-        }
-    }
-    
-    if (-not $downloaded) {
-        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
-        throw "无法下载 Chocolatey nupkg 用于修复，请检查网络"
-    }
-    
-    # 补齐 lib\chocolatey\chocolatey.nupkg
     $libSelfDir = Join-Path $chocoRoot "lib\chocolatey"
     if (-not (Test-Path $libSelfDir)) {
         New-Item -ItemType Directory -Path $libSelfDir -Force | Out-Null
     }
     $libSelfNupkg = Join-Path $libSelfDir "chocolatey.nupkg"
+    
+    $localExisting = Find-LocalChocolateyNupkg -Version $chocoVersion
+    if ($localExisting) {
+        $sizeMB = [Math]::Round((Get-Item $localExisting).Length / 1MB, 2)
+        Write-Ok "发现本地已有 chocolatey nupkg：$localExisting（$sizeMB MB）"
+        Write-Info "直接复用，跳过网络下载"
+        Copy-Item -Path $localExisting -Destination $libSelfNupkg -Force
+        Write-Ok "已补齐 choco 包索引: $libSelfNupkg"
+        return
+    }
+    
+    # ---- 优化 2：本地没有则多镜像并发下载 ----
+    Write-Info "本地未找到可复用 nupkg，启动多镜像并发下载..."
+    $tmpDir = Join-Path $env:TEMP "obsidian-sync-choco-repair"
+    if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+    
+    $githubPath = "chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg"
+    $mirrorUrls = @(
+        "https://ghfast.top/https://github.com/$githubPath",
+        "https://gh-proxy.com/https://github.com/$githubPath",
+        "https://mirror.ghproxy.com/https://github.com/$githubPath",
+        "https://ghproxy.net/https://github.com/$githubPath",
+        "https://gh.ddlc.top/https://github.com/$githubPath",
+        "https://github.com/$githubPath"
+    )
+    
+    $localNupkg = Join-Path $tmpDir "chocolatey.nupkg"
+    $winner = Invoke-ParallelDownload -Urls $mirrorUrls -OutDir $tmpDir -FinalOutFile $localNupkg -TimeoutSec 90 -MinSizeBytes 3MB
+    
+    if (-not $winner) {
+        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        throw "所有镜像并发下载均失败；请手动下载 chocolatey.$chocoVersion.nupkg 并放到任意目录后重试"
+    }
+    
+    # 补齐 lib\chocolatey\chocolatey.nupkg
     Copy-Item -Path $localNupkg -Destination $libSelfNupkg -Force
     Write-Ok "已补齐 choco 包索引: $libSelfNupkg"
     
