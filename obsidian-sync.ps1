@@ -1531,25 +1531,79 @@ function Get-PlinkPath {
 }
 
 # 首次连接时，把远端主机的 host key 写入 HKCU，避免 plink 卡在 "Store key in cache?(y/n)" 交互
+# 返回：$true = 已录入或之前已存在；$false = 录入失败（网络/密码错误等）
 function Register-PlinkHostKey {
     param(
         [Parameter(Mandatory=$true)][string]$PlinkPath,
         [Parameter(Mandatory=$true)][string]$SshHost,
         [Parameter(Mandatory=$true)][string]$SshPort
     )
+    
+    # 快路径：HKCU:\Software\SimonTatham\PuTTY\SshHostKeys 已存在该主机键时直接跳过
+    try {
+        $regPath = "HKCU:\Software\SimonTatham\PuTTY\SshHostKeys"
+        if (Test-Path $regPath) {
+            $entries = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+            if ($entries) {
+                $keyPattern = "*@${SshPort}:$SshHost"
+                $matched = $entries.PSObject.Properties | Where-Object { $_.Name -like $keyPattern }
+                if ($matched) {
+                    Write-Hint "host key 已缓存，跳过预接收"
+                    return $true
+                }
+            }
+        }
+    } catch { }
+    
+    Write-Info "首次连接该服务器，正在预接收 host key..."
     try {
         # 通过管道喂入 "y" 自动接受 host key；-batch 不能用（否则会直接拒绝未知 host）
-        # 注意：只在首次尝试时调用；若已接受过，重复执行也无害
-        "y" | & $PlinkPath -ssh -P $SshPort -l $global:SSH_USER -pw $global:SSH_PASS `
-            "$($global:SSH_HOST)" "exit" 2>&1 | Out-Null
+        # 使用临时文件引导输入以避免 PowerShell 管道编码问题
+        $tmpIn = [System.IO.Path]::GetTempFileName()
+        "y`ny`n" | Set-Content -Path $tmpIn -NoNewline -Encoding ASCII
+        
+        $output = cmd.exe /c "`"$PlinkPath`" -ssh -P $SshPort -l $($global:SSH_USER) -pw $($global:SSH_PASS) $SshHost exit < `"$tmpIn`" 2>&1"
+        $exitCode = $LASTEXITCODE
+        
+        Remove-Item $tmpIn -Force -ErrorAction SilentlyContinue
+        
+        # 检查是否已写入注册表
+        $registered = $false
+        try {
+            $entries = Get-ItemProperty -Path "HKCU:\Software\SimonTatham\PuTTY\SshHostKeys" -ErrorAction SilentlyContinue
+            if ($entries) {
+                $keyPattern = "*@${SshPort}:$SshHost"
+                $registered = [bool]($entries.PSObject.Properties | Where-Object { $_.Name -like $keyPattern })
+            }
+        } catch { }
+        
+        if ($registered) {
+            Write-Ok "host key 已成功录入 PuTTY 缓存"
+            return $true
+        }
+        
+        # 未录入：把 plink 输出暂存起来，供调用方诊断
+        $outStr = ($output | Out-String).Trim()
+        Write-Warn "host key 预接收未成功（exit=$exitCode）"
+        if ($outStr) {
+            Write-Host "   ↳ plink 原始输出:" -ForegroundColor DarkGray
+            $outStr -split "`r?`n" | Select-Object -First 20 | ForEach-Object {
+                Write-Host "   ↳ $_" -ForegroundColor DarkGray
+            }
+        }
+        $global:LAST_PLINK_OUTPUT = $outStr
+        return $false
     } catch {
-        # 容忍失败；真正的连接失败会在后续 Invoke-SSHCommand 中再次报出
-        Write-Hint "host key 预接受过程提示：$($_.Exception.Message)"
+        Write-Warn "host key 预接收过程异常：$($_.Exception.Message)"
+        return $false
     }
 }
 
 function Invoke-SSHCommand {
-    param([string]$Command)
+    param(
+        [string]$Command,
+        [switch]$CaptureStderr  # 开启后：失败时抛异常并包含 plink/ssh 原始输出，默认不开以保持向后兼容
+    )
     
     if ([string]::IsNullOrEmpty($global:SSH_PASS)) {
         throw "SSH 密码未设置，请先完成 Collect-UserInput"
@@ -1566,6 +1620,16 @@ function Invoke-SSHCommand {
             -pw $global:SSH_PASS `
             "$($global:SSH_HOST)" `
             $Command 2>&1
+        $exitCode = $LASTEXITCODE
+        
+        # 失败时将原始输出写入全局变量，便于上层打印诊断
+        if ($exitCode -ne 0) {
+            $global:LAST_PLINK_OUTPUT = ($result | Out-String).Trim()
+            if ($CaptureStderr) {
+                $detail = if ($global:LAST_PLINK_OUTPUT) { $global:LAST_PLINK_OUTPUT } else { "(plink 无输出，exit=$exitCode)" }
+                throw "plink 执行失败（exit=$exitCode）: $detail"
+            }
+        }
         return $result
     }
     
@@ -1580,6 +1644,11 @@ function Invoke-SSHCommand {
                 -p $global:SSH_PORT `
                 "$($global:SSH_USER)@$($global:SSH_HOST)" `
                 $Command 2>&1
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0 -and $CaptureStderr) {
+                $detail = ($result | Out-String).Trim()
+                throw "ssh 执行失败（exit=$exitCode）: $detail"
+            }
             return $result
         } finally {
             if ($null -eq $prevSshpass) {
@@ -1596,14 +1665,63 @@ function Invoke-SSHCommand {
 function Test-SSHConnection {
     Write-Step "测试 SSH 连接"
     
+    # 第一步：预先在 PuTTY 注册表录入 host key，避免 -batch 下首次连接被拒绝
+    $plinkPath = Get-PlinkPath
+    if ($plinkPath) {
+        $registered = Register-PlinkHostKey -PlinkPath $plinkPath -SshHost $global:SSH_HOST -SshPort $global:SSH_PORT
+        if (-not $registered) {
+            # host key 预接收失败，给出精准诊断
+            $out = $global:LAST_PLINK_OUTPUT
+            if ($out -match "Access denied|Wrong password|Server refused our password|Disconnected: Too many authentication failures") {
+                Write-Err "SSH 登录密码错误（服务器拒绝）"
+                Write-Hint "请确认：1) 密码是否正确；2) 目标用户是否允许密码登录（sshd_config: PasswordAuthentication yes）"
+                Write-Hint "可执行：Remove-Item '$env:USERPROFILE\.obsidian-sync\credentials\obsidian-sync-$($global:SSH_USER)_$($global:SSH_HOST)_$($global:SSH_PORT).cred' 后重入密码"
+                return $false
+            }
+            if ($out -match "Network error|Connection refused|Connection timed out|No route to host") {
+                Write-Err "SSH 网络层连接失败"
+                Write-Hint "已知 TCP $($global:SSH_HOST):$($global:SSH_PORT) 通（Test-Connection 返回 True），但 plink 报了网络错误——可能是防火墙深度检测或 SSH 端口上绑定的不是 sshd"
+                return $false
+            }
+            if ($out -match "host key is not cached|Server's host key did not match") {
+                Write-Err "host key 写入注册表失败，可能由于权限或策略限制"
+                Write-Hint "手动执行一次 plink 并输入 y 接受 host key：& '$plinkPath' -ssh -P $($global:SSH_PORT) -l $($global:SSH_USER) $($global:SSH_HOST) exit"
+                return $false
+            }
+            # 其他未分类错误：直接把 plink 原始输出扔出来
+            Write-Err "host key 预接收失败，无法继续"
+            if ($out) {
+                Write-Host "   ↳ plink 原始输出：" -ForegroundColor DarkGray
+                $out -split "`r?`n" | ForEach-Object { Write-Host "   ↳ $_" -ForegroundColor DarkGray }
+            }
+            return $false
+        }
+    }
+    
+    # 第二步：执行探针命令
     try {
-        $result = Invoke-SSHCommand "echo __OBSIDIAN_SYNC_PROBE_OK__"
-        if ($result -contains "__OBSIDIAN_SYNC_PROBE_OK__") {
+        $result = Invoke-SSHCommand -Command "echo __OBSIDIAN_SYNC_PROBE_OK__" -CaptureStderr
+        if ($result -match "__OBSIDIAN_SYNC_PROBE_OK__") {
             Write-Ok "SSH 连接测试成功"
             return $true
         }
+        # plink exit=0 但输出里没有探针字符串（极少见的调用环境问题）
+        Write-Err "SSH 连接返回意外的输出内容"
+        $outStr = ($result | Out-String).Trim()
+        if ($outStr) {
+            Write-Host "   ↳ 实际输出：" -ForegroundColor DarkGray
+            $outStr -split "`r?`n" | Select-Object -First 20 | ForEach-Object {
+                Write-Host "   ↳ $_" -ForegroundColor DarkGray
+            }
+        }
     } catch {
-        Write-Err "SSH 连接失败: $($_.Exception.Message)"
+        $msg = $_.Exception.Message
+        Write-Err "SSH 连接失败: $msg"
+        # 基于错误内容给出修复建议
+        if ($msg -match "Access denied|Wrong password|Server refused our password") {
+            Write-Hint "密码错误：请删除已保存的凭据重新输入"
+            Write-Hint "Remove-Item '$env:USERPROFILE\.obsidian-sync\credentials\obsidian-sync-$($global:SSH_USER)_$($global:SSH_HOST)_$($global:SSH_PORT).cred'"
+        }
     }
     return $false
 }
