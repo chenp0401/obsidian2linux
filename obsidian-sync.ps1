@@ -2323,10 +2323,18 @@ function Invoke-SyncthingApi {
     
     # 强制绕过系统代理（关键修复）：
     # Windows 用户常开着 Clash / v2rayN / Shadowsocks 的"系统代理"，
-    # PowerShell 5.1 的 Invoke-WebRequest 默认会读取 IE/WinHTTP 代理设置，
-    # 导致访问 127.0.0.1:18384 的流量被送到代理，从而长时间无响应。
-    # 这里显式把 WebRequest 的默认代理清空，保证 loopback 直连。
+    # 或设置了 HTTP_PROXY/HTTPS_PROXY 环境变量，会把 127.0.0.1 loopback
+    # 流量也送到代理，导致长时间无响应。这里做三重兜底：
+    #   1) 清空 WebRequest.DefaultWebProxy（PS 5.1 / .NET Framework 生效）
+    #   2) 清空 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 进程级环境变量（对 PS 7/.NET Core 生效）
+    #   3) 调用时 PS 7 用 -NoProxy，PS 5.1 用 -Proxy '' + ProxyUseDefaultCredentials=$false
     [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy
+    foreach ($ev in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy') {
+        if (Test-Path "Env:$ev") { Remove-Item "Env:$ev" -ErrorAction SilentlyContinue }
+    }
+    
+    # 检测是否在 PowerShell 7+（PSEdition=Core），以使用对应的参数
+    $isPS7 = $PSVersionTable.PSEdition -eq 'Core'
     
     $headers = @{}
     if ($ApiKey) { $headers["X-API-Key"] = $ApiKey }
@@ -2343,8 +2351,14 @@ function Invoke-SyncthingApi {
                 TimeoutSec   = $TimeoutSec
                 UseBasicParsing = $true
                 ErrorAction  = 'Stop'
-                Proxy        = $null
-                ProxyUseDefaultCredentials = $false
+            }
+            if ($isPS7) {
+                # PS 7+ 原生支持 -NoProxy，直接绕过所有代理
+                $params.NoProxy = $true
+            } else {
+                # PS 5.1：用空字符串 + 禁用默认凭据
+                $params.Proxy = ''
+                $params.ProxyUseDefaultCredentials = $false
             }
             if ($Body) {
                 $params.ContentType = "application/json"
