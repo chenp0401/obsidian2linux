@@ -398,25 +398,38 @@ function Install-Chocolatey {
         # 启用 TLS 1.2
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
         
-        # 候选镜像源（按优先级排序）：华为云 → 腾讯云 → 清华大学 → 官方源
+        # Chocolatey 稳定版本（可按需升级；GitHub Release 是真实存储位置）
+        $chocoVersion = "2.7.1"
+        
+        # 候选镜像源（按优先级排序）：
+        #   GitHub 代理 1 → GitHub 代理 2 → GitHub 代理 3 → GitHub 官方 → Chocolatey 官方源
+        # 说明：Chocolatey 的 nupkg 实际存放在 GitHub Release，
+        #       国内走 ghproxy 系列反代通常比官方 community.chocolatey.org 快得多
+        $githubReleasePath = "chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg"
+        
         $mirrors = @(
             @{
-                Name = "华为云"
-                PackageUrl = "https://mirrors.huaweicloud.com/chocolatey/chocolatey.0.10.15.nupkg"
+                Name = "ghproxy.link 代理"
+                PackageUrl = "https://ghproxy.link/https://github.com/$githubReleasePath"
                 InstallScriptUrl = $null
             },
             @{
-                Name = "腾讯云"
-                PackageUrl = "https://mirrors.cloud.tencent.com/chocolatey/chocolatey.0.10.15.nupkg"
+                Name = "ghfast.top 代理"
+                PackageUrl = "https://ghfast.top/https://github.com/$githubReleasePath"
                 InstallScriptUrl = $null
             },
             @{
-                Name = "清华大学"
-                PackageUrl = "https://mirrors.tuna.tsinghua.edu.cn/chocolatey/chocolatey.nupkg"
+                Name = "gh-proxy.com 代理"
+                PackageUrl = "https://gh-proxy.com/https://github.com/$githubReleasePath"
                 InstallScriptUrl = $null
             },
             @{
-                Name = "官方源"
+                Name = "GitHub 直连"
+                PackageUrl = "https://github.com/$githubReleasePath"
+                InstallScriptUrl = $null
+            },
+            @{
+                Name = "Chocolatey 官方源"
                 PackageUrl = $null
                 InstallScriptUrl = "https://community.chocolatey.org/install.ps1"
             }
@@ -469,43 +482,63 @@ function Install-Chocolatey {
                 
                 # ---- 阶段 2：下载安装脚本 / 安装包 ----
                 if ($mirror.PackageUrl) {
-                    # 下载 nupkg 到本地
+                    # 下载 nupkg 到本地，然后直接解压安装（不走官方 install.ps1，减少网络依赖）
                     $localNupkg = Join-Path $tmpDir "chocolatey.nupkg"
                     Write-Info "[阶段 2/3] 下载 Chocolatey 安装包..."
-                    Invoke-DownloadWithProgress -Url $mirror.PackageUrl -OutFile $localNupkg -TimeoutSec 60 -Activity "下载 Chocolatey 安装包（$($mirror.Name)）"
+                    try {
+                        Invoke-DownloadWithProgress -Url $mirror.PackageUrl -OutFile $localNupkg -TimeoutSec 120 -Activity "下载 Chocolatey 安装包（$($mirror.Name)）"
+                    } catch {
+                        Write-Warn "安装包下载失败：$($_.Exception.Message)"
+                        continue
+                    }
                     
-                    # 用本地 file:// URL 让官方安装脚本从本地读取 nupkg
-                    $env:chocolateyDownloadUrl = "file:///" + $localNupkg.Replace("\", "/")
-                    $env:chocolateyVersion = ""
+                    # 校验下载的文件确实是 zip/nupkg（避免下到 HTML 错误页）
+                    $fileBytes = [System.IO.File]::ReadAllBytes($localNupkg)
+                    if ($fileBytes.Length -lt 1024 -or $fileBytes[0] -ne 0x50 -or $fileBytes[1] -ne 0x4B) {
+                        Write-Warn "下载的文件不是有效的 nupkg 包（可能是错误页），文件大小：$($fileBytes.Length) 字节"
+                        continue
+                    }
                     
-                    # 下载官方安装脚本（很小，但也显示进度）
-                    $scriptUrl = "https://community.chocolatey.org/install.ps1"
+                    # ---- 阶段 3：本地解压安装 ----
+                    Write-Info "[阶段 3/3] 本地解压并安装 Chocolatey..."
+                    $installStart = [DateTime]::Now
+                    try {
+                        Install-ChocolateyFromNupkg -NupkgPath $localNupkg
+                    } catch {
+                        Write-Warn "本地解压安装失败：$($_.Exception.Message)"
+                        continue
+                    }
+                    $installElapsed = [Math]::Round(([DateTime]::Now - $installStart).TotalSeconds, 1)
+                    Write-Host "   ↳ 本地安装完毕，用时 $installElapsed 秒" -ForegroundColor DarkGray
                 } else {
+                    # 官方源：走原始 install.ps1 流程
                     $scriptUrl = $mirror.InstallScriptUrl
+                    $localScript = Join-Path $tmpDir "install.ps1"
+                    Write-Info "[阶段 2/3] 下载官方安装脚本 install.ps1..."
+                    try {
+                        Invoke-DownloadWithProgress -Url $scriptUrl -OutFile $localScript -TimeoutSec 30 -Activity "下载 Chocolatey 安装脚本"
+                    } catch {
+                        Write-Warn "安装脚本下载失败：$($_.Exception.Message)"
+                        continue
+                    }
+                    
+                    # ---- 阶段 3：执行官方安装脚本 ----
+                    Write-Info "[阶段 3/3] 执行 Chocolatey 官方安装脚本（可能需要 30-60 秒）..."
+                    Write-Host "   ↳ Chocolatey 自身正在解压、注册 PATH、刷新环境..." -ForegroundColor DarkGray
+                    $installStart = [DateTime]::Now
+                    
+                    $installScript = Get-Content -Path $localScript -Raw -Encoding UTF8
+                    Invoke-Expression $installScript
+                    
+                    $installElapsed = [Math]::Round(([DateTime]::Now - $installStart).TotalSeconds, 1)
+                    Write-Host "   ↳ 安装脚本执行完毕，用时 $installElapsed 秒" -ForegroundColor DarkGray
                 }
-                
-                $localScript = Join-Path $tmpDir "install.ps1"
-                Write-Info "[阶段 2/3] 下载安装脚本 install.ps1..."
-                try {
-                    Invoke-DownloadWithProgress -Url $scriptUrl -OutFile $localScript -TimeoutSec 30 -Activity "下载 Chocolatey 安装脚本"
-                } catch {
-                    Write-Warn "安装脚本下载失败：$($_.Exception.Message)"
-                    continue
-                }
-                
-                # ---- 阶段 3：执行安装 ----
-                Write-Info "[阶段 3/3] 执行 Chocolatey 安装脚本（可能需要 30-60 秒）..."
-                Write-Host "   ↳ Chocolatey 自身正在解压、注册 PATH、刷新环境..." -ForegroundColor DarkGray
-                $installStart = [DateTime]::Now
-                
-                $installScript = Get-Content -Path $localScript -Raw -Encoding UTF8
-                Invoke-Expression $installScript
-                
-                $installElapsed = [Math]::Round(([DateTime]::Now - $installStart).TotalSeconds, 1)
-                Write-Host "   ↳ 安装脚本执行完毕，用时 $installElapsed 秒" -ForegroundColor DarkGray
                 
                 # 刷新环境变量
                 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                if (Test-Path "$env:ProgramData\chocolatey\bin") {
+                    $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
+                }
                 
                 if (Test-Command "choco") {
                     Write-Ok "Chocolatey 安装成功（使用 $($mirror.Name) 镜像）"
@@ -517,10 +550,6 @@ function Install-Chocolatey {
             } catch {
                 Write-Warn "使用 $($mirror.Name) 镜像安装失败：$($_.Exception.Message)"
                 continue
-            } finally {
-                # 清理环境变量
-                Remove-Item Env:\chocolateyDownloadUrl -ErrorAction SilentlyContinue
-                Remove-Item Env:\chocolateyVersion -ErrorAction SilentlyContinue
             }
         }
         
@@ -528,7 +557,39 @@ function Install-Chocolatey {
         Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
         
         if (-not $installed) {
-            throw "所有镜像源均安装失败，请检查网络或手动安装 Chocolatey"
+            # 所有在线镜像都失败 —— 提示用户手动下载并兜底
+            Write-Warn "所有在线镜像均失败，尝试离线安装方案..."
+            Write-Host ""
+            Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+            Write-Host " 请手动下载 Chocolatey 安装包（任选一种方式）：" -ForegroundColor Yellow
+            Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+            Write-Host " 方式 A：用浏览器打开以下任一链接，下载 chocolatey.$chocoVersion.nupkg：" -ForegroundColor White
+            Write-Host "   1. https://ghproxy.link/https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg" -ForegroundColor Cyan
+            Write-Host "   2. https://github.com/chocolatey/choco/releases/download/$chocoVersion/chocolatey.$chocoVersion.nupkg" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host " 方式 B：从其他能联网的机器下载后通过 U 盘/网络共享传过来" -ForegroundColor White
+            Write-Host ""
+            Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Yellow
+            
+            $manualPath = Read-WithDefault "请输入已下载的 nupkg 文件完整路径（留空则放弃）" ""
+            if ([string]::IsNullOrWhiteSpace($manualPath) -or -not (Test-Path $manualPath)) {
+                throw "未提供有效的 nupkg 文件，请检查网络或手动安装 Chocolatey"
+            }
+            
+            Write-Info "使用本地 nupkg 文件安装：$manualPath"
+            Install-ChocolateyFromNupkg -NupkgPath $manualPath
+            
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+            if (Test-Path "$env:ProgramData\chocolatey\bin") {
+                $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
+            }
+            
+            if (Test-Command "choco") {
+                Write-Ok "Chocolatey 离线安装成功"
+                $installed = $true
+            } else {
+                throw "离线安装后仍未检测到 choco 命令"
+            }
         }
         
         # 安装成功后，配置 Chocolatey 使用国内镜像作为默认源
@@ -536,6 +597,74 @@ function Install-Chocolatey {
         
     } catch {
         throw "Chocolatey 安装失败: $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 从 nupkg 文件本地解压安装 Chocolatey（不需要再次联网）
+# nupkg 本质是 zip，解压到 %ProgramData%\chocolatey，然后调用其中的 chocolateyInstall.ps1
+# ---------------------------------------------------------------------------
+function Install-ChocolateyFromNupkg {
+    param([Parameter(Mandatory=$true)][string]$NupkgPath)
+    
+    if (-not (Test-Path $NupkgPath)) {
+        throw "找不到 nupkg 文件：$NupkgPath"
+    }
+    
+    $chocoInstallRoot = Join-Path $env:ProgramData "chocolatey"
+    $extractTmp = Join-Path $env:TEMP "obsidian-sync-choco-extract"
+    
+    # 清理旧的临时解压目录
+    if (Test-Path $extractTmp) {
+        Remove-Item -Path $extractTmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Path $extractTmp -Force | Out-Null
+    
+    try {
+        # 解压 nupkg（它就是一个 zip）
+        Write-Host "   ↳ 解压 nupkg 到临时目录..." -ForegroundColor DarkGray
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($NupkgPath, $extractTmp)
+        
+        # 创建 Chocolatey 主目录
+        if (-not (Test-Path $chocoInstallRoot)) {
+            New-Item -ItemType Directory -Path $chocoInstallRoot -Force | Out-Null
+        }
+        
+        # 查找 tools\chocolateyInstall\chocolateyInstall.ps1（Chocolatey 2.x 结构）
+        # 或 tools\chocolateyInstall.ps1（1.x 结构）
+        $toolsDir = Join-Path $extractTmp "tools"
+        if (-not (Test-Path $toolsDir)) {
+            throw "nupkg 中未找到 tools 目录，包结构异常"
+        }
+        
+        $chocoInstallScript = Get-ChildItem -Path $toolsDir -Filter "chocolateyInstall.ps1" -Recurse | Select-Object -First 1
+        if (-not $chocoInstallScript) {
+            # 没有自带的 install 脚本，直接把 tools 目录复制为 chocolatey 主程序
+            Write-Host "   ↳ 未找到 chocolateyInstall.ps1，采用直接复制方式..." -ForegroundColor DarkGray
+            Copy-Item -Path "$toolsDir\*" -Destination $chocoInstallRoot -Recurse -Force
+        } else {
+            Write-Host "   ↳ 执行 chocolateyInstall.ps1 完成部署..." -ForegroundColor DarkGray
+            # 设置必要的环境变量，让 chocoInstallScript 知道目标目录
+            $env:ChocolateyInstall = $chocoInstallRoot
+            & $chocoInstallScript.FullName
+        }
+        
+        # 注册 PATH（系统级）
+        $chocoBinDir = Join-Path $chocoInstallRoot "bin"
+        if (Test-Path $chocoBinDir) {
+            $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+            if ($machinePath -notlike "*$chocoBinDir*") {
+                Write-Host "   ↳ 注册 $chocoBinDir 到系统 PATH..." -ForegroundColor DarkGray
+                [System.Environment]::SetEnvironmentVariable("Path", "$machinePath;$chocoBinDir", "Machine")
+            }
+            [System.Environment]::SetEnvironmentVariable("ChocolateyInstall", $chocoInstallRoot, "Machine")
+        }
+        
+        Write-Host "   ↳ Chocolatey 文件已部署到 $chocoInstallRoot" -ForegroundColor DarkGray
+    } finally {
+        # 清理临时解压目录
+        Remove-Item -Path $extractTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
