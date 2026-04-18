@@ -1890,32 +1890,42 @@ if [ -z "$latest_tag" ]; then
 fi
 echo "将安装 Syncthing $latest_tag ($arch)"
 
-# 5) 下载（多源降级：Syncthing 官方镜像 -> 多个 ghproxy 代理 -> GitHub 直连）
+# 5) 下载（按服务器位置智能选源）
+#    - 海外服务器（如新加坡/东京/欧美）: GitHub 直连通常最快，国内代理反而绕路更慢
+#    - 国内服务器: GitHub 慢，优先走 ghfast.top/gh-proxy.com 等国内加速
+#    - 这里统一把 GitHub 直连排第一并给它最多重试机会（5 次 x 600s 总超时），
+#      同时保留国内代理作为兜底；另外加 --speed-time 30 --speed-limit 1024，
+#      30 秒内速度 <1KB/s 就放弃当前尝试避免死等
 tmpdir="$(mktemp -d)"
 tarball="syncthing-linux-${arch}-${latest_tag}.tar.gz"
-version_no_v="${latest_tag#v}"
 gh_url="https://github.com/syncthing/syncthing/releases/download/${latest_tag}/${tarball}"
 
-# 候选源按成功概率从高到低排（国内服务器视角）
-# 第 1 个是 Syncthing 官方 Apache CDN 镜像，完全绕过 GitHub，国内常常秒开
 candidates=(
-    "https://github.com/syncthing/syncthing/releases/download/${latest_tag}/${tarball}|github-direct"
-    "https://ghfast.top/${gh_url}|ghfast.top"
-    "https://gh-proxy.com/${gh_url}|gh-proxy.com"
-    "https://ghproxy.link/${gh_url}|ghproxy.link"
-    "https://mirror.ghproxy.com/${gh_url}|mirror.ghproxy.com"
-    "https://download.fastgit.org/syncthing/syncthing/releases/download/${latest_tag}/${tarball}|fastgit"
+    "https://github.com/syncthing/syncthing/releases/download/${latest_tag}/${tarball}|github-direct|5"
+    "https://ghfast.top/${gh_url}|ghfast.top|3"
+    "https://gh-proxy.com/${gh_url}|gh-proxy.com|3"
+    "https://ghproxy.link/${gh_url}|ghproxy.link|3"
+    "https://mirror.ghproxy.com/${gh_url}|mirror.ghproxy.com|3"
+    "https://gh.ddlc.top/${gh_url}|gh.ddlc.top|3"
 )
 
 download_ok=0
 for item in "${candidates[@]}"; do
-    try_url="${item%%|*}"
-    label="${item##*|}"
-    echo "---- 尝试 [$label]: $try_url ----"
-    # 注意：-f 遇到 4xx/5xx 直接失败；--retry 3 对瞬时错误重试；--max-time 300 给大文件留足时间
-    if curl -fL --connect-timeout 10 --max-time 300 --retry 3 --retry-delay 2 \
+    # 解析 URL|label|retries 三元组
+    try_url="$(echo "$item" | cut -d'|' -f1)"
+    label="$(echo "$item" | cut -d'|' -f2)"
+    retries="$(echo "$item" | cut -d'|' -f3)"
+    echo "---- 尝试 [$label] (retries=$retries): $try_url ----"
+    # -4: 强制 IPv4（很多海外 VPS 的 IPv6 配置有问题会卡住）
+    # --connect-timeout 15: TCP 握手 15s 超时
+    # --max-time 600: 单次下载总时长上限 10 分钟
+    # --retry N --retry-delay 3 --retry-all-errors: 瞬时错误重试
+    # --speed-time 30 --speed-limit 1024: 30s 内速度 <1KB/s 就放弃
+    if curl -fL -4 \
+            --connect-timeout 15 --max-time 600 \
+            --retry "$retries" --retry-delay 3 --retry-all-errors \
+            --speed-time 30 --speed-limit 1024 \
             -o "$tmpdir/$tarball" "$try_url" 2>&1 | tail -5; then
-        # 下载后用 gzip -t 预检——很多"代理失败"会返回 HTML 错误页（状态码 200 但内容不是 gz）
         if gzip -t "$tmpdir/$tarball" 2>/dev/null; then
             actual_size=$(stat -c%s "$tmpdir/$tarball" 2>/dev/null || wc -c <"$tmpdir/$tarball")
             echo "[$label] 下载成功，文件大小：$actual_size 字节"
@@ -1924,19 +1934,23 @@ for item in "${candidates[@]}"; do
         else
             got_size=$(stat -c%s "$tmpdir/$tarball" 2>/dev/null || wc -c <"$tmpdir/$tarball")
             head_bytes=$(head -c 200 "$tmpdir/$tarball" 2>/dev/null | tr -d '\0' | head -c 120)
-            echo "[$label] 文件已下载（$got_size 字节）但不是有效的 gz 归档（可能代理返回了错误页）"
+            echo "[$label] 文件已下载（$got_size 字节）但不是有效的 gz 归档（代理可能返回了错误页）"
             echo "    内容开头：$head_bytes"
             rm -f "$tmpdir/$tarball"
         fi
     else
-        echo "[$label] 下载失败（curl 返回非零）"
+        curl_rc=$?
+        echo "[$label] 下载失败（curl rc=$curl_rc）"
         rm -f "$tmpdir/$tarball" 2>/dev/null || true
     fi
 done
 
 if [ "$download_ok" != "1" ]; then
     rm -rf "$tmpdir"
-    echo "ERROR: 所有下载源均失败，请检查服务器出站网络，或手动下载后上传到 $tmpdir/$tarball 再重试" >&2
+    echo "ERROR: 所有下载源均失败，请检查服务器出站网络" >&2
+    echo "可手动执行以下命令看服务器到 GitHub 的连通情况：" >&2
+    echo "  curl -v --connect-timeout 10 -o /dev/null https://github.com" >&2
+    echo "  curl -v --connect-timeout 10 -o /dev/null $gh_url" >&2
     exit 1
 fi
 
