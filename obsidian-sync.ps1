@@ -2501,7 +2501,12 @@ function New-SSHTunnel {
     
     Write-Ok "SSH 隧道建立成功（plink PID=$($proc.Id)）"
     
-    # 4) 探测远端 GUI 是否启用 TLS（影响 http/https 协议）
+    # 4) 先把默认 HTTP URL 同步到 global 作用域（关键修复）
+    #    Wait-RemoteApiReady / Invoke-RemoteApi 都通过 $global:REMOTE_API_URL 读取，
+    #    必须无条件初始化一次；TLS 分支再按需覆盖为 https。
+    $global:REMOTE_API_URL = "http://127.0.0.1:$REMOTE_API_LOCAL_PORT"
+    
+    # 5) 探测远端 GUI 是否启用 TLS（影响 http/https 协议）
     $tlsScriptTemplate = @'
 sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
 if $sudo_cmd grep -qE '<gui[^>]+tls="true"' "__CFG__" 2>/dev/null; then
@@ -2517,6 +2522,9 @@ fi
         # 覆盖脚本级变量（给 Invoke-RemoteApi 用）
         Set-Variable -Name REMOTE_API_URL -Value $global:REMOTE_API_URL -Scope Script
         Write-Info "检测到远端 GUI 启用了 TLS，切换为 HTTPS 访问"
+    } else {
+        # 非 TLS 也同步一次脚本级变量，保持一致
+        Set-Variable -Name REMOTE_API_URL -Value $global:REMOTE_API_URL -Scope Script
     }
 }
 
