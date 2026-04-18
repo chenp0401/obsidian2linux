@@ -17,13 +17,19 @@
 
 # 设置错误处理
 $ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
+# 注意：不开启 Set-StrictMode -Version Latest
+#   - 我们大量使用 $global:SSH_HOST 这种跨作用域全局变量
+#   - JSON 反序列化后可能访问可选字段 ($config.server.host)，Latest 下会对缺失字段抛异常
+#   - 使用较宽松的 2.0 可覆盖未声明变量/未初始化属性的主要风险，且不干扰正常流程
+Set-StrictMode -Version 2.0
 
 # ============================================================================
 # 编码设置与修复（解决VSCode和PowerShell终端中文显示不一致问题）
 # ============================================================================
 
 # 强制设置UTF-8编码（在脚本开始时立即执行）
+# 注意：此函数在顶层调用时，Write-Warn 等日志函数尚未定义，所以内部只能用
+#       原生 Write-Host/Write-Warning，不要调用项目内的自定义日志函数！
 function Initialize-Encoding {
     try {
         # 1. 设置PowerShell内部编码
@@ -32,18 +38,19 @@ function Initialize-Encoding {
         $PSDefaultParameterValues['*:Encoding'] = 'UTF8'
         
         # 2. 设置系统代码页为UTF-8
-        $codePageResult = chcp 65001 2>&1
+        $null = chcp 65001 2>&1
         
         # 3. 设置环境变量（影响子进程）
         $env:PYTHONIOENCODING = "utf-8"
         $env:LANG = "en_US.UTF-8"
         
-        # 4. 验证设置结果
+        # 4. 等待代码页切换落盘
         Start-Sleep -Milliseconds 50
         
         return $true
     } catch {
-        Write-Warn "编码初始化失败: $($_.Exception.Message)"
+        # 顶层调用时自定义 Write-Warn 可能还没定义，用原生 Write-Warning 保证一定可用
+        Write-Warning "编码初始化失败: $($_.Exception.Message)"
         return $false
     }
 }
@@ -122,7 +129,7 @@ function Test-AndFix-Encoding {
             [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
             Write-Ok "基础编码设置完成"
         } catch {
-            Write-Error "编码设置完全失败，中文可能显示异常"
+            Write-Err "编码设置完全失败，中文可能显示异常"
         }
     }
 }
@@ -190,12 +197,21 @@ function Write-Log {
     }
 }
 
-function Write-Info    { Write-Log "INFO" $args -Color "Blue" }
-function Write-Ok      { Write-Log "OK" $args -Color "Green" }
-function Write-Warn    { Write-Log "WARN" $args -Color "Yellow" }
-function Write-Error   { Write-Log "ERR" $args -Color "Red" }
-function Write-Step    { Write-Log "STEP" $args -Color "Cyan" }
-function Write-Hint    { Write-Host "   ↳ $($args[0])" -ForegroundColor "DarkGray" }
+# ---------------------------------------------------------------------------
+# 日志包装函数
+# 注意事项：
+#   1) *不要* 把函数命名为 Write-Error —— 它是 PowerShell 内置 cmdlet，
+#      覆盖后会让 $ErrorActionPreference='Stop' 语义失效，主流程 catch 永远捕捉不到。
+#      因此改名为 Write-Err。
+#   2) 使用显式 [string]$Message 接参而不是 $args（数组），避免
+#      Set-StrictMode 下参数绑定与类型转换的边界行为。
+# ---------------------------------------------------------------------------
+function Write-Info { param([string]$Message) Write-Log "INFO" $Message -Color "Blue" }
+function Write-Ok   { param([string]$Message) Write-Log "OK"   $Message -Color "Green" }
+function Write-Warn { param([string]$Message) Write-Log "WARN" $Message -Color "Yellow" }
+function Write-Err  { param([string]$Message) Write-Log "ERR"  $Message -Color "Red" }
+function Write-Step { param([string]$Message) Write-Log "STEP" $Message -Color "Cyan" }
+function Write-Hint { param([string]$Message) Write-Host "   ↳ $Message" -ForegroundColor "DarkGray" }
 
 function Confirm {
     param(
@@ -273,7 +289,7 @@ function Check-Dependencies {
         if (Test-Command $cmd) {
             Write-Ok "已安装：$cmd"
         } else {
-            Write-Error "缺少必需依赖：$cmd"
+            Write-Err "缺少必需依赖：$cmd"
             $missing += $cmd
         }
     }
@@ -747,11 +763,11 @@ function Request-AdminElevation {
                 Write-Ok "已启动管理员窗口，当前窗口将退出"
                 exit 0
             } catch {
-                Write-Error "UAC 提权被拒绝或失败：$($_.Exception.Message)"
+                Write-Err "UAC 提权被拒绝或失败：$($_.Exception.Message)"
                 return $false
             }
         } else {
-            Write-Error "无法定位脚本路径，请手动以管理员身份重新运行"
+            Write-Err "无法定位脚本路径，请手动以管理员身份重新运行"
             return $false
         }
     }
@@ -808,7 +824,8 @@ function Install-WindowsService {
     
     try {
         # 使用 sc.exe 创建服务
-        $result = sc.exe create $ServiceName binPath= "`"$ExecutablePath`"" DisplayName= "$DisplayName" start= "auto"
+        # 注意：sc.exe 的语法要求参数名与等号紧挨，等号后接空格再跟值
+        $null = sc.exe create $ServiceName binPath= "`"$ExecutablePath`"" DisplayName= "$DisplayName" start= "auto"
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "服务创建成功"
             
@@ -821,7 +838,7 @@ function Install-WindowsService {
         }
         
     } catch {
-        Write-Error "服务安装失败: $($_.Exception.Message)"
+        Write-Err "服务安装失败: $($_.Exception.Message)"
         return $false
     }
 }
@@ -834,7 +851,7 @@ function Start-WindowsService {
         Write-Ok "服务 '$ServiceName' 启动成功"
         return $true
     } catch {
-        Write-Error "服务启动失败: $($_.Exception.Message)"
+        Write-Err "服务启动失败: $($_.Exception.Message)"
         return $false
     }
 }
@@ -878,8 +895,32 @@ function Invoke-SSHCommand {
         throw "未安装 sshpass，无法非交互登录"
     }
     
-    $cmd = "sshpass -e ssh -p $SSH_PORT $SSH_USER@$SSH_HOST `"$Command`""
-    return Invoke-Expression $cmd
+    if ([string]::IsNullOrEmpty($global:SSH_PASS)) {
+        throw "SSH 密码未设置，请先完成 Collect-UserInput"
+    }
+    
+    # sshpass -e 从环境变量 SSHPASS 读取密码；
+    # 必须在调用前设置，否则 sshpass 会报 "no password provided"
+    $prevSshpass = $env:SSHPASS
+    $env:SSHPASS = $global:SSH_PASS
+    try {
+        # 使用原生参数数组调用（PowerShell 7 推荐方式），避免 Invoke-Expression
+        # 带来的引号/特殊字符注入；stderr 重定向到 stdout 便于抓取错误信息
+        $result = & sshpass -e ssh `
+            -o StrictHostKeyChecking=no `
+            -o UserKnownHostsFile=/dev/null `
+            -p $global:SSH_PORT `
+            "$($global:SSH_USER)@$($global:SSH_HOST)" `
+            $Command 2>&1
+        return $result
+    } finally {
+        # 恢复原始 SSHPASS，避免密码泄漏到后续子进程
+        if ($null -eq $prevSshpass) {
+            Remove-Item Env:SSHPASS -ErrorAction SilentlyContinue
+        } else {
+            $env:SSHPASS = $prevSshpass
+        }
+    }
 }
 
 function Test-SSHConnection {
@@ -892,7 +933,7 @@ function Test-SSHConnection {
             return $true
         }
     } catch {
-        Write-Error "SSH 连接失败: $($_.Exception.Message)"
+        Write-Err "SSH 连接失败: $($_.Exception.Message)"
     }
     return $false
 }
@@ -971,7 +1012,7 @@ function Main {
         Write-Hint "后续将实现：Windows 服务管理、Syncthing 安装、API 调用等功能"
         
     } catch {
-        Write-Error "执行失败: $($_.Exception.Message)"
+        Write-Err "执行失败: $($_.Exception.Message)"
         exit 1
     }
 }
@@ -1003,19 +1044,25 @@ function Collect-UserInput {
 }
 
 function Load-LastConfig {
-    if (Test-Path $STATE_FILE) {
-        try {
-            $config = Get-Content $STATE_FILE | ConvertFrom-Json
-            $global:SSH_HOST = $config.server.host
-            $global:SSH_USER = $config.server.user
-            $global:SSH_PORT = $config.server.port
+    if (-not (Test-Path $STATE_FILE)) { return }
+    
+    try {
+        $config = Get-Content $STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+        
+        # 注意：StrictMode 下直接访问 $config.server.host，若字段不存在会 throw；
+        # 使用 PSObject.Properties 做安全访问
+        if ($config -and $config.PSObject.Properties.Name -contains 'server') {
+            $server = $config.server
+            if ($server.PSObject.Properties.Name -contains 'host') { $global:SSH_HOST = [string]$server.host }
+            if ($server.PSObject.Properties.Name -contains 'user') { $global:SSH_USER = [string]$server.user }
+            if ($server.PSObject.Properties.Name -contains 'port') { $global:SSH_PORT = [string]$server.port }
             
-            if ($SSH_HOST) {
-                Write-Info "已从上次运行记录加载：${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
+            if (-not [string]::IsNullOrEmpty($global:SSH_HOST)) {
+                Write-Info "已从上次运行记录加载：$($global:SSH_USER)@$($global:SSH_HOST):$($global:SSH_PORT)"
             }
-        } catch {
-            Write-Warn "加载上次配置失败: $($_.Exception.Message)"
         }
+    } catch {
+        Write-Warn "加载上次配置失败: $($_.Exception.Message)"
     }
 }
 
