@@ -27,19 +27,76 @@ $PSDefaultParameterValues['*:Encoding'] = 'UTF8'
 # 编码检测与修复函数
 function Test-AndFix-Encoding {
     try {
-        # 检测当前控制台编码
-        $currentEncoding = [Console]::OutputEncoding.EncodingName
-        Write-Info "当前控制台编码: $currentEncoding"
+        Write-Info "开始编码检测与修复..."
         
-        # 如果检测到非UTF-8编码，尝试修复
-        if ($currentEncoding -notlike "*UTF*" -and $currentEncoding -notlike "*Unicode*") {
-            Write-Warn "检测到非UTF-8编码，正在修复..."
-            chcp 65001 | Out-Null  # 设置控制台代码页为UTF-8
-            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-            Write-Ok "编码已修复为UTF-8"
+        # 检测当前控制台编码
+        $consoleEncoding = [Console]::OutputEncoding.EncodingName
+        $outputEncoding = $OutputEncoding.EncodingName
+        $currentCodePage = chcp | Out-String
+        
+        Write-Info "当前编码状态："
+        Write-Info "  - 控制台编码: $consoleEncoding"
+        Write-Info "  - 输出编码: $outputEncoding"
+        Write-Info "  - 代码页: $currentCodePage"
+        
+        # 检查是否需要修复
+        $needsFix = $false
+        $fixes = @()
+        
+        if ($consoleEncoding -notlike "*UTF*" -and $consoleEncoding -notlike "*Unicode*") {
+            $needsFix = $true
+            $fixes += "控制台编码非UTF-8"
         }
+        
+        if ($outputEncoding -notlike "*UTF*" -and $outputEncoding -notlike "*Unicode*") {
+            $needsFix = $true
+            $fixes += "输出编码非UTF-8"
+        }
+        
+        if ($currentCodePage -notmatch "65001") {
+            $needsFix = $true
+            $fixes += "代码页非UTF-8"
+        }
+        
+        if ($needsFix) {
+            Write-Warn "检测到编码问题: $($fixes -join ', ')"
+            Write-Warn "正在修复编码设置..."
+            
+            # 强制设置UTF-8编码
+            chcp 65001 | Out-Null
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            $OutputEncoding = [System.Text.Encoding]::UTF8
+            $PSDefaultParameterValues['*:Encoding'] = 'UTF8'
+            
+            # 验证修复结果
+            Start-Sleep -Milliseconds 100
+            $newConsoleEncoding = [Console]::OutputEncoding.EncodingName
+            $newOutputEncoding = $OutputEncoding.EncodingName
+            $newCodePage = chcp | Out-String
+            
+            Write-Ok "编码修复完成："
+            Write-Ok "  - 新控制台编码: $newConsoleEncoding"
+            Write-Ok "  - 新输出编码: $newOutputEncoding"
+            Write-Ok "  - 新代码页: $newCodePage"
+            
+            # 测试中文显示
+            Write-Info "测试中文显示：中文测试内容 ✔ ✘ ℹ ⚠ ▶"
+        } else {
+            Write-Ok "编码设置正常，无需修复"
+        }
+        
     } catch {
         Write-Warn "编码检测失败: $($_.Exception.Message)"
+        Write-Warn "尝试基础编码设置..."
+        
+        # 基础编码设置作为备用方案
+        try {
+            chcp 65001 | Out-Null
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            Write-Ok "基础编码设置完成"
+        } catch {
+            Write-Error "编码设置完全失败，中文可能显示异常"
+        }
     }
 }
 

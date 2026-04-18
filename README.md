@@ -110,19 +110,54 @@ PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
 - **PowerShell 彩色输出** - 友好的交互界面
 - **远程桌面编码修复** - 自动检测并修复远程桌面环境下的乱码问题
 
-### 🖥️ 远程桌面使用说明
-如果在远程桌面环境下运行脚本时遇到**中文乱码**问题，脚本会自动检测并修复：
+### 🖥️ Windows 编码问题解决方案
 
-1. **自动编码修复**：脚本启动时自动检测控制台编码，如发现非UTF-8编码会自动修复
-2. **手动测试**：如需单独测试编码修复效果，可运行：
+#### 问题描述
+在**远程桌面环境**或**某些Windows终端**中运行PowerShell脚本时，可能会出现**中文乱码**问题。这是因为Windows默认使用不同的编码系统（如GBK、ANSI），而脚本使用UTF-8编码。
+
+#### 自动解决方案
+脚本已内置**智能编码检测与修复**功能：
+
+1. **启动时自动检测**：脚本启动时自动检查当前控制台编码状态
+2. **自动修复**：检测到非UTF-8编码时自动修复为UTF-8
+3. **详细日志**：显示修复前后的编码状态对比
+
+#### 手动测试与验证
+如需单独测试编码修复效果，可运行：
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File test-encoding.ps1
+# 运行专门的编码测试脚本
+PowerShell -ExecutionPolicy Bypass -File test-encoding-fix.ps1
 ```
-3. **手动修复**：如自动修复失败，可手动执行：
+
+#### 手动修复命令（备用方案）
+如果自动修复失败，可手动执行以下命令：
 ```powershell
-chcp 65001  # 设置控制台代码页为UTF-8
+# 设置控制台代码页为UTF-8
+chcp 65001
+
+# 设置PowerShell输出编码为UTF-8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+# 设置默认参数编码
+$PSDefaultParameterValues['*:Encoding'] = 'UTF8'
 ```
+
+#### 常见乱码场景与解决方案
+
+| 场景 | 症状 | 解决方案 |
+|------|------|----------|
+| 远程桌面连接 | 中文显示为乱码方块 | 运行 `test-encoding-fix.ps1` 验证修复 |
+| Windows PowerShell | 特殊符号显示异常 | 确保使用UTF-8编码执行脚本 |
+| 文件日志乱码 | 日志文件中文乱码 | 脚本已使用 `-Encoding UTF8` 参数 |
+| 终端显示异常 | 符号显示为问号 | 检查终端字体是否支持Unicode |
+
+#### 验证修复效果
+修复成功后，您应该能看到：
+- ✅ 中文字符正常显示
+- ✅ 特殊符号（✔ ✘ ℹ ⚠ ▶）正确显示  
+- ✅ 文件日志中文内容正常
+- ✅ 控制台编码显示为UTF-8相关编码
 
 详细使用说明请查看：[Windows 版本文档](README-Windows.md)
 
