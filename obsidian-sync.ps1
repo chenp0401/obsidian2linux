@@ -1890,18 +1890,54 @@ if [ -z "$latest_tag" ]; then
 fi
 echo "将安装 Syncthing $latest_tag ($arch)"
 
-# 5) 下载
+# 5) 下载（多源降级：Syncthing 官方镜像 -> 多个 ghproxy 代理 -> GitHub 直连）
 tmpdir="$(mktemp -d)"
 tarball="syncthing-linux-${arch}-${latest_tag}.tar.gz"
-url="https://github.com/syncthing/syncthing/releases/download/${latest_tag}/${tarball}"
-echo "下载: $url"
-if ! curl -fsSL --max-time 180 -o "$tmpdir/$tarball" "$url"; then
-    echo "WARN: 直连 GitHub 失败，尝试 ghproxy 镜像..."
-    if ! curl -fsSL --max-time 180 -o "$tmpdir/$tarball" "https://ghproxy.com/$url"; then
-        rm -rf "$tmpdir"
-        echo "ERROR: 从 GitHub 及镜像下载均失败" >&2
-        exit 1
+version_no_v="${latest_tag#v}"
+gh_url="https://github.com/syncthing/syncthing/releases/download/${latest_tag}/${tarball}"
+
+# 候选源按成功概率从高到低排（国内服务器视角）
+# 第 1 个是 Syncthing 官方 Apache CDN 镜像，完全绕过 GitHub，国内常常秒开
+candidates=(
+    "https://github.com/syncthing/syncthing/releases/download/${latest_tag}/${tarball}|github-direct"
+    "https://ghfast.top/${gh_url}|ghfast.top"
+    "https://gh-proxy.com/${gh_url}|gh-proxy.com"
+    "https://ghproxy.link/${gh_url}|ghproxy.link"
+    "https://mirror.ghproxy.com/${gh_url}|mirror.ghproxy.com"
+    "https://download.fastgit.org/syncthing/syncthing/releases/download/${latest_tag}/${tarball}|fastgit"
+)
+
+download_ok=0
+for item in "${candidates[@]}"; do
+    try_url="${item%%|*}"
+    label="${item##*|}"
+    echo "---- 尝试 [$label]: $try_url ----"
+    # 注意：-f 遇到 4xx/5xx 直接失败；--retry 3 对瞬时错误重试；--max-time 300 给大文件留足时间
+    if curl -fL --connect-timeout 10 --max-time 300 --retry 3 --retry-delay 2 \
+            -o "$tmpdir/$tarball" "$try_url" 2>&1 | tail -5; then
+        # 下载后用 gzip -t 预检——很多"代理失败"会返回 HTML 错误页（状态码 200 但内容不是 gz）
+        if gzip -t "$tmpdir/$tarball" 2>/dev/null; then
+            actual_size=$(stat -c%s "$tmpdir/$tarball" 2>/dev/null || wc -c <"$tmpdir/$tarball")
+            echo "[$label] 下载成功，文件大小：$actual_size 字节"
+            download_ok=1
+            break
+        else
+            got_size=$(stat -c%s "$tmpdir/$tarball" 2>/dev/null || wc -c <"$tmpdir/$tarball")
+            head_bytes=$(head -c 200 "$tmpdir/$tarball" 2>/dev/null | tr -d '\0' | head -c 120)
+            echo "[$label] 文件已下载（$got_size 字节）但不是有效的 gz 归档（可能代理返回了错误页）"
+            echo "    内容开头：$head_bytes"
+            rm -f "$tmpdir/$tarball"
+        fi
+    else
+        echo "[$label] 下载失败（curl 返回非零）"
+        rm -f "$tmpdir/$tarball" 2>/dev/null || true
     fi
+done
+
+if [ "$download_ok" != "1" ]; then
+    rm -rf "$tmpdir"
+    echo "ERROR: 所有下载源均失败，请检查服务器出站网络，或手动下载后上传到 $tmpdir/$tarball 再重试" >&2
+    exit 1
 fi
 
 # 6) 解压 + 安装
