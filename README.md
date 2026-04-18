@@ -77,6 +77,31 @@ chmod +x obsidian-sync.sh
 
 ---
 
+## 🖥️ Windows 版本
+
+现已提供 Windows 专用的 PowerShell 版本！
+
+### 📁 Windows 版本文件
+- **[obsidian-sync.ps1](obsidian-sync.ps1)** - Windows PowerShell 主脚本
+- **[README-Windows.md](README-Windows.md)** - Windows 专用使用说明
+- **[test-windows.ps1](test-windows.ps1)** - Windows 环境测试脚本
+
+### 🚀 Windows 快速开始
+```powershell
+# 以管理员权限运行 PowerShell，然后执行：
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
+```
+
+### 🔧 Windows 特有功能
+- **Chocolatey 包管理** - 自动安装依赖
+- **Windows 服务管理** - sc.exe 服务控制
+- **Windows 凭据管理器** - 安全存储密码
+- **PowerShell 彩色输出** - 友好的交互界面
+
+详细使用说明请查看：[Windows 版本文档](README-Windows.md)
+
+---
+
 ## 📦 系统要求
 
 ### 本地（macOS）
