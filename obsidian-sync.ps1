@@ -19,10 +19,37 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-# 设置编码（解决远程桌面乱码问题）
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-$PSDefaultParameterValues['*:Encoding'] = 'UTF8'
+# ============================================================================
+# 编码设置与修复（解决VSCode和PowerShell终端中文显示不一致问题）
+# ============================================================================
+
+# 强制设置UTF-8编码（在脚本开始时立即执行）
+function Initialize-Encoding {
+    try {
+        # 1. 设置PowerShell内部编码
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $OutputEncoding = [System.Text.Encoding]::UTF8
+        $PSDefaultParameterValues['*:Encoding'] = 'UTF8'
+        
+        # 2. 设置系统代码页为UTF-8
+        $codePageResult = chcp 65001 2>&1
+        
+        # 3. 设置环境变量（影响子进程）
+        $env:PYTHONIOENCODING = "utf-8"
+        $env:LANG = "en_US.UTF-8"
+        
+        # 4. 验证设置结果
+        Start-Sleep -Milliseconds 50
+        
+        return $true
+    } catch {
+        Write-Warn "编码初始化失败: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# 立即执行编码初始化
+Initialize-Encoding | Out-Null
 
 # 编码检测与修复函数
 function Test-AndFix-Encoding {
@@ -484,7 +511,7 @@ function Collect-UserInput {
     $global:SSH_PORT = Read-WithDefault "SSH 端口" $SSH_PORT
     
     # 密码处理
-    $credTarget = "obsidian-sync-$SSH_USER@$SSH_HOST:$SSH_PORT"
+    $credTarget = "obsidian-sync-${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
     $savedPass = Get-WindowsCredential $credTarget
     
     if ($savedPass) {
