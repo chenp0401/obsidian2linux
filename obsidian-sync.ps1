@@ -2321,6 +2321,13 @@ function Invoke-SyncthingApi {
     )
     Disable-CertificateValidation
     
+    # 强制绕过系统代理（关键修复）：
+    # Windows 用户常开着 Clash / v2rayN / Shadowsocks 的"系统代理"，
+    # PowerShell 5.1 的 Invoke-WebRequest 默认会读取 IE/WinHTTP 代理设置，
+    # 导致访问 127.0.0.1:18384 的流量被送到代理，从而长时间无响应。
+    # 这里显式把 WebRequest 的默认代理清空，保证 loopback 直连。
+    [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy
+    
     $headers = @{}
     if ($ApiKey) { $headers["X-API-Key"] = $ApiKey }
     
@@ -2336,6 +2343,8 @@ function Invoke-SyncthingApi {
                 TimeoutSec   = $TimeoutSec
                 UseBasicParsing = $true
                 ErrorAction  = 'Stop'
+                Proxy        = $null
+                ProxyUseDefaultCredentials = $false
             }
             if ($Body) {
                 $params.ContentType = "application/json"
@@ -2545,10 +2554,37 @@ fi
         Write-Hint "远端 8384 端口监听正常"
     }
     
+    # 0.5) L4 TCP 探测：检查本地 18384 是否能真正 connect 到远端（绕开 HTTP 层）
+    #      这一步可以立刻暴露"plink 建了监听但 SSH 握手还没完成"之类的问题
+    $tcpReady = $false
+    for ($i = 0; $i -lt 15; $i++) {
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $async = $tcp.BeginConnect("127.0.0.1", [int]$REMOTE_API_LOCAL_PORT, $null, $null)
+            if ($async.AsyncWaitHandle.WaitOne(1500)) {
+                $tcp.EndConnect($async)
+                $tcp.Close()
+                $tcpReady = $true
+                break
+            } else {
+                $tcp.Close()
+            }
+        } catch {
+            # 忽略单次失败，继续重试
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($tcpReady) {
+        Write-Hint "L4 隧道连通性正常（127.0.0.1:$REMOTE_API_LOCAL_PORT 可 connect）"
+    } else {
+        Write-Warn "L4 探测失败：连不通 127.0.0.1:$REMOTE_API_LOCAL_PORT（隧道可能未就绪）"
+    }
+    
     # 1) 开始轮询 API（60 秒）
     $waited = 0
     $maxWait = 60
     $lastErr = ""
+    $firstErrPrinted = $false
     while ($waited -lt $maxWait) {
         try {
             $r = Invoke-SyncthingApi -Method GET -Url "$($global:REMOTE_API_URL)/rest/system/ping" -ApiKey $global:REMOTE_API_KEY -Retries 1 -TimeoutSec 3
@@ -2561,7 +2597,12 @@ fi
             $lastErr = "API 返回非 pong 响应：$rStr"
         } catch {
             $lastErr = $_.Exception.Message
-            # 每 10 秒打印一次当前错误，避免用户盲等
+            # 首次失败立刻打印一次，便于早期定位
+            if (-not $firstErrPrinted) {
+                Write-Hint "首次调用错误：$lastErr"
+                $firstErrPrinted = $true
+            }
+            # 之后每 10 秒打印一次当前错误，避免用户盲等
             if (($waited % 10) -eq 0 -and $waited -gt 0) {
                 Write-Hint "已等待 ${waited}s，最近一次错误：$lastErr"
             }
@@ -2570,11 +2611,28 @@ fi
         $waited++
     }
     
-    # 失败时打印完整诊断信息
+    # 失败时打印完整诊断信息 + 自动跑一次 curl.exe 对比
     Write-Warn "远端 API 在 $maxWait 秒内未能响应"
     Write-Hint "最后一次错误：$lastErr"
     Write-Hint "当前请求地址：$($global:REMOTE_API_URL)/rest/system/ping"
     Write-Hint "当前 API Key 长度：$($global:REMOTE_API_KEY.Length)"
+    
+    # 自动用 curl.exe 对比（curl 不走 PowerShell 的代理栈）
+    $curlPath = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
+    if ($curlPath) {
+        Write-Hint "正在使用 curl.exe 对比测试..."
+        try {
+            $curlOut = & $curlPath -sS -m 5 -H "X-API-Key: $($global:REMOTE_API_KEY)" "$($global:REMOTE_API_URL)/rest/system/ping" 2>&1
+            Write-Hint "curl.exe 返回：$curlOut"
+            if ("$curlOut" -match "pong") {
+                Write-Warn "curl.exe 能通，但 Invoke-WebRequest 不通 —— 大概率是系统代理（Clash/v2rayN 等）拦截了 127.0.0.1 流量"
+                Write-Hint "  → 请关闭系统代理后重试，或在代理软件中把 127.0.0.1 / localhost 加入绕过列表"
+            }
+        } catch {
+            Write-Hint "curl.exe 测试也失败：$($_.Exception.Message)"
+        }
+    }
+    
     Write-Hint "诊断建议："
     Write-Hint "  1) 本地手动测试：curl.exe -v http://127.0.0.1:$REMOTE_API_LOCAL_PORT/rest/system/ping"
     Write-Hint "  2) 服务器直连测试：ssh $($global:SSH_USER)@$($global:SSH_HOST) `"curl -s -H 'X-API-Key: $($global:REMOTE_API_KEY)' http://127.0.0.1:8384/rest/system/ping`""
