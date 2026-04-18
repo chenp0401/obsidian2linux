@@ -161,6 +161,12 @@ $global:SSH_TUNNEL_PROCESS = $null
 $global:REMOTE_GUI_USER = ""
 $global:REMOTE_GUI_PASS = $null
 
+# 远端运行上下文（由步骤 2 填充）
+$global:REMOTE_RUN_USER = ""
+$global:REMOTE_HOME = ""
+$global:REMOTE_CONFIG_DIR = ""
+$global:REMOTE_CONFIG_XML = ""
+
 # 回滚栈
 $global:ROLLBACK_STACK = @()
 
@@ -1727,6 +1733,497 @@ function Test-SSHConnection {
 }
 
 # ---------------------------------------------------------------------------
+# 模块：remote —— 服务器端 Syncthing 部署（步骤 2/8）
+# 设计要点：
+#   - sh 版用一个 heredoc 投送多行脚本到 ssh 远端 bash -s，我们需要
+#     用 plink 的 stdin 实现同样效果：把脚本内容写到临时文件 →
+#     cmd.exe /c "plink ... bash -s < tempfile" 读取返回
+#   - 除了次号引内插值必须用双引外，所有远端脚本均用 PowerShell
+#     的单引号 here-string (@'...'@) 包裹，保证 $, ``, ", \
+#     等字符不被 PS 解释
+#   - 无论成败都将 plink 原始 stdout 以字符串返回，调用方再 awk/regex
+#     提取 KV 或校验关键字
+# ---------------------------------------------------------------------------
+function Invoke-SSHScript {
+    param(
+        [Parameter(Mandatory=$true)][string]$Script,
+        [switch]$ThrowOnError  # 开启后，远端 exit 非零时抛异常并包含输出
+    )
+    
+    if ([string]::IsNullOrEmpty($global:SSH_PASS)) {
+        throw "SSH 密码未设置，请先完成 Collect-UserInput"
+    }
+    $plinkPath = Get-PlinkPath
+    if (-not $plinkPath) {
+        throw "未找到 plink.exe，无法执行远端脚本"
+    }
+    
+    # 1) 将脚本写入临时文件（统一用 LF + UTF8-NoBOM，避免远端 bash 遇到 CRLF 结尾报错）
+    $scriptLF = $Script -replace "`r`n", "`n"
+    $tmpScript = [System.IO.Path]::GetTempFileName()
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmpScript, $scriptLF, $utf8NoBom)
+    
+    try {
+        # 2) 通过 cmd.exe 重定向 stdin 给 plink——PowerShell 的 | 管道对同时传递 stdin 与读取 stdout 处理不得很好，改用 cmd 的 < 重定向更稳
+        # plink 的 -batch 必须保留（host key 已在 Test-SSHConnection 阺段预接收）
+        # 输出捕获使用 2>&1 将 stderr 合并，便于打印完整诊断
+        $cmdLine = "`"$plinkPath`" -ssh -batch -P $($global:SSH_PORT) -l $($global:SSH_USER) -pw $($global:SSH_PASS) $($global:SSH_HOST) `"bash -s`" < `"$tmpScript`" 2>&1"
+        $rawOutput = cmd.exe /c $cmdLine
+        $exitCode = $LASTEXITCODE
+        $output = ($rawOutput | Out-String)
+        
+        if ($exitCode -ne 0 -and $ThrowOnError) {
+            throw "远端脚本执行失败（exit=$exitCode）:`n$($output.Trim())"
+        }
+        return @{
+            Success  = ($exitCode -eq 0)
+            ExitCode = $exitCode
+            Output   = $output
+        }
+    } finally {
+        Remove-Item $tmpScript -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 从 KV 输出中提取单个字段 (形如 KEY=value 的行)
+function Get-KVValue {
+    param([string]$Text, [string]$Key)
+    $pattern = "(?m)^$([regex]::Escape($Key))=(.*)$"
+    $m = [regex]::Match($Text, $pattern)
+    if ($m.Success) { return $m.Groups[1].Value.Trim() }
+    return $null
+}
+
+# ---- 2.1 探测远端环境 ----
+function Get-RemoteEnv {
+    $script = @'
+set -e
+. /etc/os-release 2>/dev/null || true
+ID_LIKE_STR="${ID_LIKE:-}"
+printf "OS_ID=%s\n"        "${ID:-unknown}"
+printf "OS_LIKE=%s\n"      "$ID_LIKE_STR"
+printf "VERSION_ID=%s\n"   "${VERSION_ID:-unknown}"
+if command -v apt-get >/dev/null 2>&1; then printf "PKG_MGR=apt\n"
+elif command -v dnf >/dev/null 2>&1; then   printf "PKG_MGR=dnf\n"
+elif command -v yum >/dev/null 2>&1; then   printf "PKG_MGR=yum\n"
+else                                        printf "PKG_MGR=unknown\n"
+fi
+if command -v syncthing >/dev/null 2>&1; then
+    printf "SYNCTHING_INSTALLED=1\n"
+    printf "SYNCTHING_VERSION=%s\n" "$(syncthing --version 2>/dev/null | head -1 | awk '{print $2}')"
+else
+    printf "SYNCTHING_INSTALLED=0\n"
+fi
+printf "WHOAMI=%s\n"       "$(whoami)"
+printf "HOME=%s\n"         "$HOME"
+printf "HAS_SYSTEMD=%s\n"  "$(command -v systemctl >/dev/null 2>&1 && echo 1 || echo 0)"
+'@
+    $r = Invoke-SSHScript -Script $script -ThrowOnError
+    return $r.Output
+}
+
+# ---- 2.2 安装远端 Syncthing（强制 v2.x，从 GitHub release 拉二进制） ----
+function Install-RemoteSyncthing {
+    Write-Info "使用 GitHub release 二进制方式安装 Syncthing（保证 v2.x 与本地 Windows 客户端兼容）..."
+    $script = @'
+set -e
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+
+# 1) 已装且 v2.x → 跳过；否则卸旧装
+
+if command -v syncthing >/dev/null 2>&1; then
+    cur_ver="$(syncthing --version 2>/dev/null | head -1 | awk '{print $2}')"
+    cur_major="${cur_ver#v}"; cur_major="${cur_major%%.*}"
+    if [ -n "$cur_major" ] && [ "$cur_major" -ge 2 ] 2>/dev/null; then
+        echo "syncthing already >= v2.x ($cur_ver)，跳过"
+        exit 0
+    fi
+    echo "卸载旧版 syncthing ($cur_ver)..."
+    $sudo_cmd systemctl stop "syncthing@*" 2>/dev/null || true
+    pkill -9 -f "syncthing serve" 2>/dev/null || true
+    if command -v apt-get >/dev/null 2>&1 && dpkg -l syncthing 2>/dev/null | grep -q "^ii"; then
+        DEBIAN_FRONTEND=noninteractive $sudo_cmd apt-get purge -y syncthing syncthing-discosrv syncthing-relaysrv 2>&1 | tail -3 || true
+        $sudo_cmd rm -f /etc/apt/sources.list.d/syncthing*.list \
+                        /etc/apt/keyrings/syncthing-archive-keyring.gpg \
+                        /etc/apt/keyrings/syncthing-archive-keyring.asc
+    elif command -v dnf >/dev/null 2>&1 && dnf list installed syncthing >/dev/null 2>&1; then
+        $sudo_cmd dnf remove -y syncthing || true
+        $sudo_cmd rm -f /etc/yum.repos.d/syncthing.repo
+    elif command -v yum >/dev/null 2>&1 && yum list installed syncthing >/dev/null 2>&1; then
+        $sudo_cmd yum remove -y syncthing || true
+        $sudo_cmd rm -f /etc/yum.repos.d/syncthing.repo
+    fi
+    $sudo_cmd rm -f /usr/bin/syncthing /usr/local/bin/syncthing
+fi
+
+# 2) 依赖工具
+if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive $sudo_cmd apt-get install -y -q curl tar ca-certificates >/dev/null 2>&1 || true
+elif command -v dnf >/dev/null 2>&1; then
+    $sudo_cmd dnf install -y curl tar ca-certificates >/dev/null 2>&1 || true
+elif command -v yum >/dev/null 2>&1; then
+    $sudo_cmd yum install -y curl tar ca-certificates >/dev/null 2>&1 || true
+fi
+
+# 3) 架构
+uname_m="$(uname -m)"
+case "$uname_m" in
+    x86_64|amd64)   arch="amd64" ;;
+    aarch64|arm64)  arch="arm64" ;;
+    armv7l|armv7*)  arch="arm" ;;
+    i386|i686)      arch="386" ;;
+    *) echo "ERROR: 不支持的 CPU 架构：$uname_m" >&2; exit 1 ;;
+esac
+
+# 4) 查最新 v2.x tag
+latest_tag=""
+if command -v curl >/dev/null 2>&1; then
+    latest_tag="$(curl -fsSL --max-time 15 https://api.github.com/repos/syncthing/syncthing/releases/latest 2>/dev/null \
+                  | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v[^"]+"' \
+                  | head -1 \
+                  | sed -E 's/.*"(v[^"]+)".*/\1/')"
+fi
+if [ -z "$latest_tag" ]; then
+    latest_tag="v2.0.16"
+    echo "WARN: 无法从 GitHub API 获取最新版本号，回退使用 $latest_tag"
+fi
+echo "将安装 Syncthing $latest_tag ($arch)"
+
+# 5) 下载
+tmpdir="$(mktemp -d)"
+tarball="syncthing-linux-${arch}-${latest_tag}.tar.gz"
+url="https://github.com/syncthing/syncthing/releases/download/${latest_tag}/${tarball}"
+echo "下载: $url"
+if ! curl -fsSL --max-time 180 -o "$tmpdir/$tarball" "$url"; then
+    echo "WARN: 直连 GitHub 失败，尝试 ghproxy 镜像..."
+    if ! curl -fsSL --max-time 180 -o "$tmpdir/$tarball" "https://ghproxy.com/$url"; then
+        rm -rf "$tmpdir"
+        echo "ERROR: 从 GitHub 及镜像下载均失败" >&2
+        exit 1
+    fi
+fi
+
+# 6) 解压 + 安装
+cd "$tmpdir"
+tar xzf "$tarball"
+extracted_dir="$(find . -maxdepth 1 -type d -name 'syncthing-linux-*' | head -1)"
+if [ -z "$extracted_dir" ] || [ ! -x "$extracted_dir/syncthing" ]; then
+    echo "ERROR: 解压后未找到 syncthing 二进制" >&2
+    rm -rf "$tmpdir"
+    exit 1
+fi
+$sudo_cmd install -m 0755 "$extracted_dir/syncthing" /usr/local/bin/syncthing
+[ -e /usr/bin/syncthing ] || $sudo_cmd ln -sf /usr/local/bin/syncthing /usr/bin/syncthing
+cd /
+rm -rf "$tmpdir"
+
+# 7) systemd unit
+if [ ! -f /etc/systemd/system/syncthing@.service ] && [ ! -f /lib/systemd/system/syncthing@.service ]; then
+    echo "写入 /etc/systemd/system/syncthing@.service"
+    $sudo_cmd tee /etc/systemd/system/syncthing@.service >/dev/null <<'UNIT'
+[Unit]
+Description=Syncthing - Open Source Continuous File Synchronization for %I
+Documentation=man:syncthing(1)
+After=network.target
+
+[Service]
+User=%i
+ExecStart=/usr/local/bin/syncthing serve --no-browser --no-restart --logflags=0
+Restart=on-failure
+RestartSec=5
+SuccessExitStatus=3 4
+RestartForceExitStatus=3 4
+
+ProtectSystem=full
+PrivateTmp=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    $sudo_cmd systemctl daemon-reload
+fi
+
+echo "INSTALLED: $(syncthing --version 2>&1 | head -1)"
+'@
+    $r = Invoke-SSHScript -Script $script
+    # 输出转向终端，便于诊断
+    $r.Output -split "`r?`n" | ForEach-Object {
+        if ($_ -match "^\s*$") { return }
+        Write-Host "   ↳ $_" -ForegroundColor DarkGray
+    }
+    if (-not $r.Success) {
+        throw "Syncthing 安装失败（GitHub 二进制安装流程出错，请查上方日志）"
+    }
+    Write-Ok "Syncthing 安装完成（v2.x GitHub 二进制）"
+}
+
+# ---- 2.3 初始化远端配置（首次启动生成 config.xml） ----
+function Initialize-RemoteSyncthingConfig {
+    Write-Info "初始化 Syncthing 配置（首次启动以生成 config.xml）..."
+    $scriptTemplate = @'
+set -e
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+RUN_USER="__RUN_USER__"
+RUN_HOME="__RUN_HOME__"
+
+as_user() {
+    if [ "$(whoami)" = "$RUN_USER" ]; then
+        env HOME="$RUN_HOME" "$@"
+    else
+        $sudo_cmd -u "$RUN_USER" env HOME="$RUN_HOME" "$@"
+    fi
+}
+
+CFG_PATH="$(as_user syncthing paths 2>/dev/null | awk '/^Configuration file:/ {getline; gsub(/^[ \t]+/, "", $0); print; exit}')"
+if [ -z "$CFG_PATH" ]; then
+    CFG_PATH="$(as_user syncthing --paths 2>/dev/null | awk '/^Configuration file:/ {getline; gsub(/^[ \t]+/, "", $0); print; exit}')"
+fi
+if [ -z "$CFG_PATH" ]; then
+    if [ -d "$RUN_HOME/.local/state/syncthing" ]; then
+        CFG_PATH="$RUN_HOME/.local/state/syncthing/config.xml"
+    else
+        CFG_PATH="$RUN_HOME/.config/syncthing/config.xml"
+    fi
+fi
+CFG_DIR="$(dirname "$CFG_PATH")"
+echo "DETECTED_CFG_PATH=$CFG_PATH"
+
+if [ -f "$CFG_PATH" ]; then
+    echo "CONFIG_READY=1 (existing)"
+    exit 0
+fi
+
+mkdir -p "$CFG_DIR"
+[ "$(whoami)" = "$RUN_USER" ] || $sudo_cmd chown -R "$RUN_USER":"$RUN_USER" "$CFG_DIR" 2>/dev/null || true
+
+gen_out="$(as_user syncthing generate --home="$CFG_DIR" 2>&1)" && gen_rc=0 || gen_rc=$?
+echo "---- generate(v2 --home) rc=$gen_rc ----"
+echo "$gen_out" | tail -10
+
+if [ ! -f "$CFG_PATH" ]; then
+    gen_out2="$(as_user syncthing generate --home="$CFG_DIR" --no-default-folder 2>&1)" || true
+    echo "---- generate(v1.20-1.29 --home + --no-default-folder) ----"
+    echo "$gen_out2" | tail -10
+fi
+
+if [ ! -f "$CFG_PATH" ]; then
+    gen_out3="$(as_user syncthing generate --no-default-folder 2>&1)" || true
+    echo "---- generate(legacy subcommand) ----"
+    echo "$gen_out3" | tail -10
+fi
+
+if [ ! -f "$CFG_PATH" ]; then
+    gen_out4="$(as_user syncthing -generate="$CFG_DIR" -no-default-folder 2>&1)" || true
+    echo "---- generate(very-old flag) ----"
+    echo "$gen_out4" | tail -10
+fi
+
+if [ ! -f "$CFG_PATH" ]; then
+    echo "---- fallback: foreground bootstrap ----"
+    tmplog="$(mktemp)"
+    as_user syncthing serve --home="$CFG_DIR" --no-browser >"$tmplog" 2>&1 &
+    pid=$!
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        as_user syncthing serve --no-browser --no-default-folder >"$tmplog" 2>&1 &
+        pid=$!
+        sleep 1
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        as_user syncthing -no-browser -no-default-folder >"$tmplog" 2>&1 &
+        pid=$!
+    fi
+    for i in $(seq 1 30); do
+        [ -f "$CFG_PATH" ] && break
+        sleep 1
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    tail -15 "$tmplog" 2>/dev/null
+    rm -f "$tmplog"
+fi
+
+if [ -f "$CFG_PATH" ]; then
+    echo "CONFIG_READY=1"
+else
+    echo "CONFIG_READY=0"
+    ls -la "$CFG_DIR" 2>&1
+fi
+'@
+    $script = $scriptTemplate.Replace("__RUN_USER__", $global:REMOTE_RUN_USER).Replace("__RUN_HOME__", $global:REMOTE_HOME)
+    $r = Invoke-SSHScript -Script $script
+    
+    if ($r.Output -notmatch "CONFIG_READY=1") {
+        Write-Host "──── 服务器端初始化输出 ────" -ForegroundColor Yellow
+        Write-Host $r.Output -ForegroundColor DarkGray
+        Write-Host "──────────────────────────────────" -ForegroundColor Yellow
+        throw "Syncthing 配置初始化失败，详见上方服务器输出"
+    }
+    
+    $detected = Get-KVValue -Text $r.Output -Key "DETECTED_CFG_PATH"
+    if ($detected) {
+        $global:REMOTE_CONFIG_XML = $detected
+        $global:REMOTE_CONFIG_DIR = Split-Path -Parent $detected
+    }
+    Write-Ok "Syncthing 配置已生成：$($global:REMOTE_CONFIG_XML)"
+}
+
+# ---- 2.4 创建同步根目录 ----
+function New-RemoteSyncDir {
+    Write-Info "准备同步根目录 $DEFAULT_REMOTE_ROOT..."
+    $scriptTemplate = @'
+set -e
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+$sudo_cmd mkdir -p "__ROOT__"
+$sudo_cmd chown -R "__RUN_USER__":"__RUN_USER__" "__ROOT__" || true
+ls -ld "__ROOT__"
+'@
+    $script = $scriptTemplate.Replace("__ROOT__", $DEFAULT_REMOTE_ROOT).Replace("__RUN_USER__", $global:REMOTE_RUN_USER)
+    $r = Invoke-SSHScript -Script $script
+    $r.Output -split "`r?`n" | Where-Object { $_ -match "\S" } | ForEach-Object {
+        Write-Host "   ↳ $_" -ForegroundColor DarkGray
+    }
+    if (-not $r.Success) {
+        throw "创建同步目录 $DEFAULT_REMOTE_ROOT 失败"
+    }
+    Write-Ok "同步目录已就绪"
+}
+
+# ---- 2.5 注册 systemd 服务并启动 ----
+function Enable-RemoteSyncthingService {
+    Write-Info "配置 systemd 服务并启动..."
+    $scriptTemplate = @'
+set -e
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+RUN_USER="__RUN_USER__"
+$sudo_cmd systemctl daemon-reload || true
+$sudo_cmd systemctl enable "syncthing@${RUN_USER}.service" >/dev/null 2>&1 || true
+$sudo_cmd systemctl restart "syncthing@${RUN_USER}.service"
+sleep 2
+$sudo_cmd systemctl is-active "syncthing@${RUN_USER}.service"
+'@
+    $script = $scriptTemplate.Replace("__RUN_USER__", $global:REMOTE_RUN_USER)
+    $r = Invoke-SSHScript -Script $script
+    $lastLine = ($r.Output -split "`r?`n" | Where-Object { $_ -match "\S" } | Select-Object -Last 1)
+    if ($lastLine -match "^active$") {
+        Write-Ok "syncthing@$($global:REMOTE_RUN_USER).service 已启动并设置开机自启"
+    } else {
+        Write-Host $r.Output -ForegroundColor DarkGray
+        throw "systemd 服务启动失败"
+    }
+}
+
+# ---- 2.6 开放防火墙端口 ----
+function Open-RemoteFirewall {
+    Write-Info "尝试放通防火墙端口（22000/tcp, 22000/udp, 21027/udp）..."
+    $script = @'
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+if command -v ufw >/dev/null 2>&1 && $sudo_cmd ufw status 2>/dev/null | grep -q "Status: active"; then
+    $sudo_cmd ufw allow 22000/tcp >/dev/null 2>&1 || true
+    $sudo_cmd ufw allow 22000/udp >/dev/null 2>&1 || true
+    $sudo_cmd ufw allow 21027/udp >/dev/null 2>&1 || true
+    echo "FIREWALL=ufw"
+elif command -v firewall-cmd >/dev/null 2>&1 && $sudo_cmd firewall-cmd --state 2>/dev/null | grep -q running; then
+    $sudo_cmd firewall-cmd --permanent --add-port=22000/tcp >/dev/null 2>&1 || true
+    $sudo_cmd firewall-cmd --permanent --add-port=22000/udp >/dev/null 2>&1 || true
+    $sudo_cmd firewall-cmd --permanent --add-port=21027/udp >/dev/null 2>&1 || true
+    $sudo_cmd firewall-cmd --reload >/dev/null 2>&1 || true
+    echo "FIREWALL=firewalld"
+else
+    echo "FIREWALL=none"
+fi
+'@
+    $r = Invoke-SSHScript -Script $script
+    switch -Regex ($r.Output) {
+        "FIREWALL=ufw"       { Write-Ok "已通过 ufw 放通端口"; break }
+        "FIREWALL=firewalld" { Write-Ok "已通过 firewalld 放通端口"; break }
+        default              { Write-Warn "未检测到活动防火墙；请自行确认云厂商安全组已放通 22000、21027 端口" }
+    }
+}
+
+# ---- 2.7 读取远端 Device ID 与 API Key ----
+function Read-RemoteIdentity {
+    Write-Info "读取服务器 Device ID 与 API Key..."
+    $scriptTemplate = @'
+set -e
+CFG="__CFG__"
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+DID=$($sudo_cmd grep -oE '<device id="[A-Z0-9-]+"' "$CFG" | head -1 | sed -E 's/.*id="([A-Z0-9-]+)".*/\1/')
+AKEY=$($sudo_cmd grep -oE '<apikey>[^<]+</apikey>' "$CFG" | sed -E 's/<\/?apikey>//g')
+printf "DEVICE_ID=%s\n" "$DID"
+printf "API_KEY=%s\n"   "$AKEY"
+'@
+    $script = $scriptTemplate.Replace("__CFG__", $global:REMOTE_CONFIG_XML)
+    $r = Invoke-SSHScript -Script $script -ThrowOnError
+    $global:REMOTE_DEVICE_ID = Get-KVValue -Text $r.Output -Key "DEVICE_ID"
+    $global:REMOTE_API_KEY   = Get-KVValue -Text $r.Output -Key "API_KEY"
+    if ([string]::IsNullOrEmpty($global:REMOTE_DEVICE_ID) -or [string]::IsNullOrEmpty($global:REMOTE_API_KEY)) {
+        throw "无法解析服务器 config.xml 中的 Device ID / API Key"
+    }
+    $didMasked = "$($global:REMOTE_DEVICE_ID.Substring(0, [Math]::Min(14, $global:REMOTE_DEVICE_ID.Length)))...$($global:REMOTE_DEVICE_ID.Substring([Math]::Max(0, $global:REMOTE_DEVICE_ID.Length - 7)))"
+    Write-Ok "服务器 Device ID：$didMasked"
+}
+
+# ---- 2.8 步骤 2 主入口 ----
+function Deploy-RemoteSyncthing {
+    Write-Step "步骤 2/8：服务器端 Syncthing 部署"
+    
+    # 探测环境
+    Write-Info "探测服务器环境..."
+    $envOut = Get-RemoteEnv
+    $osId      = Get-KVValue -Text $envOut -Key "OS_ID"
+    $pkgMgr    = Get-KVValue -Text $envOut -Key "PKG_MGR"
+    $installed = Get-KVValue -Text $envOut -Key "SYNCTHING_INSTALLED"
+    $syncVer   = Get-KVValue -Text $envOut -Key "SYNCTHING_VERSION"
+    $whoamiOut = Get-KVValue -Text $envOut -Key "WHOAMI"
+    $remoteHome= Get-KVValue -Text $envOut -Key "HOME"
+    $hasSd     = Get-KVValue -Text $envOut -Key "HAS_SYSTEMD"
+    
+    $global:REMOTE_RUN_USER   = $whoamiOut
+    $global:REMOTE_HOME       = $remoteHome
+    $global:REMOTE_CONFIG_DIR = "$remoteHome/.config/syncthing"
+    $global:REMOTE_CONFIG_XML = "$($global:REMOTE_CONFIG_DIR)/config.xml"
+    
+    Write-Info "OS=$osId  包管理器=$pkgMgr  运行用户=$($global:REMOTE_RUN_USER)  systemd=$hasSd"
+    
+    if ($hasSd -ne "1") {
+        throw "服务器未安装 systemd，目前脚本仅支持基于 systemd 的发行版"
+    }
+    
+    # 版本策略：强制 v2.x
+    $needInstall = $false
+    if ($installed -ne "1") {
+        $needInstall = $true
+    } else {
+        $verNum = $syncVer
+        if ($verNum) { $verNum = $verNum -replace "^v", "" }
+        $majorStr = ($verNum -split "\.")[0]
+        $majorInt = 0
+        [void][int]::TryParse($majorStr, [ref]$majorInt)
+        if ($majorInt -lt 2) {
+            Write-Warn "服务器已安装 Syncthing $syncVer，但版本过旧（需要 v2.x 以兼容本地客户端），将强制升级"
+            $needInstall = $true
+        } else {
+            Write-Ok "Syncthing 已安装（版本：$syncVer），跳过安装步骤（幂等）"
+        }
+    }
+    
+    if ($needInstall) {
+        Install-RemoteSyncthing
+    }
+    
+    Initialize-RemoteSyncthingConfig
+    New-RemoteSyncDir
+    Enable-RemoteSyncthingService
+    Open-RemoteFirewall
+    Read-RemoteIdentity
+}
+
+# ---------------------------------------------------------------------------
 # 模块：Windows 凭据管理
 # 设计说明：
 #   早期版本使用 PowerShell Gallery 上的第三方模块 CredentialManager 提供的
@@ -1850,8 +2347,12 @@ function Main {
             throw "SSH 连接测试失败"
         }
         
-        Write-Ok "Windows 版本脚本框架已创建，核心功能实现中..."
-        Write-Hint "后续将实现：Windows 服务管理、Syncthing 安装、API 调用等功能"
+        # 步骤 2/8：服务器端 Syncthing 部署
+        Deploy-RemoteSyncthing
+        
+        Write-Host ""
+        Write-Warn "步骤 3/8 至 8/8 尚在实现中（本地 Syncthing 安装、API 隐道、设备配对、Vault 选择、文件夹共享、总结）"
+        Write-Hint "服务器端已配置完毕，Web UI：http://$($global:SSH_HOST):8384（需添加本地设备后才能同步）"
         
     } catch {
         Write-Err "执行失败: $($_.Exception.Message)"
