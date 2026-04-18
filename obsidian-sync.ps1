@@ -540,6 +540,69 @@ function Repair-Chocolatey {
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ---------------------------------------------------------------------------
+# 修复 Chocolatey 源配置
+# 早期版本错误地把"华为云 NuGet 镜像"添加为优先级 1 并禁用官方源，
+# 但华为云 NuGet 源只包含 .NET 类库，不包含 Chocolatey 应用包（putty/jq/fzf 等），
+# 导致所有应用包安装失败："The package was not found with the source(s) listed"
+# 此函数自动检测并修复：删除错误镜像、重新启用官方 chocolatey 源
+# ---------------------------------------------------------------------------
+function Repair-ChocolateySources {
+    if (-not (Test-Command "choco")) { return }
+    
+    try {
+        $sourceList = & choco source list 2>&1 | Out-String
+    } catch {
+        return
+    }
+    
+    $needsRepair = $false
+    
+    # 信号 1：存在华为云 NuGet 镜像（误用为 choco 源）
+    if ($sourceList -match "huaweicloud") {
+        $needsRepair = $true
+    }
+    
+    # 信号 2：官方 chocolatey 源被禁用
+    # 官方源行的典型格式：chocolatey - https://community.chocolatey.org/api/v2/ [Priority 0|Bypass Proxy - False|Self-Service - False|Admin Only - False]
+    # 禁用时行首会出现 "[Disabled]" 或 choco source list 会标记
+    if ($sourceList -match "(?im)^chocolatey\s+.*\[Disabled\]" -or 
+        $sourceList -match "(?im)chocolatey.*Disabled\s*=\s*True") {
+        $needsRepair = $true
+    }
+    
+    if (-not $needsRepair) { return }
+    
+    Write-Warn "检测到 Chocolatey 源配置异常（早期版本错误配置了不兼容的华为云 NuGet 源）"
+    Write-Hint "这会导致 choco install putty/jq/fzf 等应用包全部失败"
+    Write-Info "正在自动修复..."
+    
+    try {
+        # 1) 删除错误的华为云源
+        if ($sourceList -match "huaweicloud") {
+            & choco source remove -n="huaweicloud" 2>&1 | Out-Null
+            Write-Ok "已移除华为云 NuGet 源"
+        }
+        
+        # 2) 重新启用官方 chocolatey 源
+        & choco source enable -n="chocolatey" 2>&1 | Out-Null
+        Write-Ok "已启用 Chocolatey 官方源"
+        
+        # 3) 验证修复结果
+        $newList = & choco source list 2>&1 | Out-String
+        if ($newList -match "(?im)^chocolatey\s+-\s+https://community\.chocolatey\.org") {
+            Write-Ok "Chocolatey 源配置已修复"
+        } else {
+            Write-Warn "源配置修复可能未生效，请手动检查：choco source list"
+        }
+    } catch {
+        Write-Warn "源配置修复失败：$($_.Exception.Message)"
+        Write-Hint "请手动执行："
+        Write-Hint "  choco source remove -n=huaweicloud"
+        Write-Hint "  choco source enable -n=chocolatey"
+    }
+}
+
 function Check-Dependencies {
     Write-Step "检查本地依赖"
     
@@ -562,6 +625,9 @@ function Check-Dependencies {
         } else {
             Write-Ok "已安装：Chocolatey 包管理器"
         }
+        
+        # 无论 choco 本体是否健康，都检查源配置是否被历史版本破坏
+        Repair-ChocolateySources
     }
     
     $required = @("ssh", "curl")
@@ -968,8 +1034,9 @@ function Install-Chocolatey {
             }
         }
         
-        # 安装成功后，配置 Chocolatey 使用国内镜像作为默认源
-        Set-ChocolateyMirror
+        # 安装成功后不再配置任何镜像源（历史教训：华为云 NuGet 源不兼容 choco）
+        # Chocolatey 官方源已足够好用；如需加速，可后续从代理层面解决，而不是用错误的源替换
+        Write-Info "保留 Chocolatey 官方源配置（华为云 NuGet 镜像不兼容，不使用）"
         
     } catch {
         throw "Chocolatey 安装失败: $($_.Exception.Message)"
@@ -1137,34 +1204,13 @@ function Request-AdminElevation {
     return $false
 }
 
-function Set-ChocolateyMirror {
-    Write-Step "配置 Chocolatey 使用国内镜像源"
-    
-    try {
-        # 添加华为云镜像源（优先级最高）
-        $huaweiSource = "https://mirrors.huaweicloud.com/repository/nuget/v3/index.json"
-        
-        # 查看现有源
-        $existingSources = choco source list 2>&1 | Out-String
-        
-        if ($existingSources -notmatch "huaweicloud") {
-            Write-Info "添加华为云镜像源..."
-            choco source add -n="huaweicloud" -s="$huaweiSource" --priority=1 | Out-Null
-            Write-Ok "已添加华为云镜像源（优先级 1）"
-        } else {
-            Write-Ok "华为云镜像源已存在"
-        }
-        
-        # 禁用官方源（可选，加速后续安装）
-        if (Confirm "是否禁用 Chocolatey 官方源以强制使用国内镜像？（推荐）" "Y") {
-            choco source disable -n="chocolatey" 2>&1 | Out-Null
-            Write-Ok "已禁用 Chocolatey 官方源"
-        }
-        
-    } catch {
-        Write-Warn "配置镜像源失败：$($_.Exception.Message)"
-        Write-Hint "可稍后手动执行：choco source add -n=huaweicloud -s=https://mirrors.huaweicloud.com/repository/nuget/v3/index.json --priority=1"
-    }
+function Set-ChocolateyMirror_DEPRECATED {
+    # ⚠ 历史版本遗留的错误逻辑——已废弃，不再调用
+    # 原因：华为云 NuGet 源（mirrors.huaweicloud.com/repository/nuget/）只包含 .NET NuGet 包，
+    # 不包含 Chocolatey 的应用包（putty/jq/fzf 等）。将其设为优先级 1 并禁用官方源后，
+    # 任何 choco install 都会失败。函数仅作为警示保留，不会被调用。
+    Write-Warn "Set-ChocolateyMirror 已废弃（华为云 NuGet 不兼容 choco），跳过执行"
+    return
 }
 
 # 添加 Windows 服务管理功能
