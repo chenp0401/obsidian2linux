@@ -19,6 +19,30 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# 设置编码（解决远程桌面乱码问题）
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$PSDefaultParameterValues['*:Encoding'] = 'UTF8'
+
+# 编码检测与修复函数
+function Test-AndFix-Encoding {
+    try {
+        # 检测当前控制台编码
+        $currentEncoding = [Console]::OutputEncoding.EncodingName
+        Write-Info "当前控制台编码: $currentEncoding"
+        
+        # 如果检测到非UTF-8编码，尝试修复
+        if ($currentEncoding -notlike "*UTF*" -and $currentEncoding -notlike "*Unicode*") {
+            Write-Warn "检测到非UTF-8编码，正在修复..."
+            chcp 65001 | Out-Null  # 设置控制台代码页为UTF-8
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            Write-Ok "编码已修复为UTF-8"
+        }
+    } catch {
+        Write-Warn "编码检测失败: $($_.Exception.Message)"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 全局常量与运行时变量
 # ---------------------------------------------------------------------------
@@ -361,6 +385,9 @@ function Main {
         Write-Host "版本: $SCRIPT_VERSION" -ForegroundColor Gray
         Write-Host "操作系统: Windows $( [System.Environment]::OSVersion.Version )" -ForegroundColor Gray
         Write-Host ""
+        
+        # 编码检测与修复（解决远程桌面乱码问题）
+        Test-AndFix-Encoding
         
         # 创建状态目录
         if (-not (Test-Path $STATE_DIR)) {
