@@ -278,8 +278,9 @@ function Check-Dependencies {
     }
     
     $required = @("ssh", "curl")
+    # Windows 下非交互式 SSH 首选 plink（PuTTY 套件），
+    # 已在 Invoke-SSHCommand 内做了兜底；这里只作提示，不强制
     $optional = @(
-        @{Name="sshpass"; Description="非交互式 SSH 密码登录"},
         @{Name="jq"; Description="JSON 解析"},
         @{Name="fzf"; Description="目录多选 TUI"}
     )
@@ -305,14 +306,40 @@ function Check-Dependencies {
         throw "请先安装缺失的必需依赖后再重试。"
     }
     
+    # ---- 非交互式 SSH 客户端检测（plink.exe 优先） ----
+    $plinkPath = Get-PlinkPath
+    if ($plinkPath) {
+        Write-Ok "已安装：plink.exe（PuTTY 非交互式 SSH）→ $plinkPath"
+    } elseif (Test-Command "sshpass") {
+        Write-Ok "已安装：sshpass（非交互式 SSH 密码登录，备选方案）"
+    } else {
+        Write-Warn "未检测到 plink.exe 或 sshpass（非交互式 SSH 登录工具）"
+        Write-Hint "  - 推荐安装 PuTTY（含 plink.exe）: choco install putty -y"
+        Write-Hint "  - 或安装 sshpass（备选）: choco install sshpass -y"
+        
+        if ((Test-Command "choco") -and (Confirm "是否立即通过 Chocolatey 安装 PuTTY（推荐）？" "Y")) {
+            try {
+                choco install putty -y --no-progress | Out-Null
+                # 刷新 PATH
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                $plinkPath = Get-PlinkPath
+                if ($plinkPath) {
+                    Write-Ok "PuTTY 安装成功：$plinkPath"
+                } else {
+                    Write-Warn "PuTTY 安装命令已执行，但未检测到 plink.exe，可能需要重启终端"
+                }
+            } catch {
+                Write-Warn "PuTTY 安装失败：$($_.Exception.Message)"
+            }
+        }
+    }
+    
     foreach ($item in $optional) {
         if (Test-Command $item.Name) {
             Write-Ok "已安装：$($item.Name)（$($item.Description)）"
         } else {
             Write-Warn "未检测到 $($item.Name)（$($item.Description)）"
-            # Windows 安装提示
             switch ($item.Name) {
-                "sshpass" { Write-Hint "  - 安装: choco install sshpass -y" }
                 "jq" { Write-Hint "  - 安装: choco install jq -y" }
                 "fzf" { Write-Hint "  - 安装: choco install fzf -y" }
             }
@@ -888,39 +915,94 @@ function Convert-ToUnixPath {
 # ---------------------------------------------------------------------------
 # 模块：ssh —— 远程命令执行
 # ---------------------------------------------------------------------------
+#
+# Windows 下非交互 SSH 登录的选型说明：
+#   - 首选 plink.exe（PuTTY 套件）：Windows 原生可用，choco install putty 极稳定；
+#     支持 -pw 直接传密码、-batch 禁用交互。
+#   - 备选 sshpass：Chocolatey 的 sshpass 是 cygwin 版，兼容性差，仅作兜底。
+#   - 所有命令行都把 stderr 重定向到 stdout（2>&1），便于上层捕获错误信息。
+# ---------------------------------------------------------------------------
+
+# 查找 plink.exe 的绝对路径（choco 安装后一般在 C:\Program Files\PuTTY\plink.exe）
+function Get-PlinkPath {
+    # 1) 优先使用 PATH 中的 plink
+    $cmd = Get-Command "plink.exe" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    
+    # 2) 尝试常见安装位置
+    $candidates = @(
+        "$env:ProgramFiles\PuTTY\plink.exe",
+        "${env:ProgramFiles(x86)}\PuTTY\plink.exe",
+        "$env:ChocolateyInstall\bin\plink.exe",
+        "$env:ProgramData\chocolatey\bin\plink.exe"
+    )
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    return $null
+}
+
+# 首次连接时，把远端主机的 host key 写入 HKCU，避免 plink 卡在 "Store key in cache?(y/n)" 交互
+function Register-PlinkHostKey {
+    param(
+        [Parameter(Mandatory=$true)][string]$PlinkPath,
+        [Parameter(Mandatory=$true)][string]$SshHost,
+        [Parameter(Mandatory=$true)][string]$SshPort
+    )
+    try {
+        # 通过管道喂入 "y" 自动接受 host key；-batch 不能用（否则会直接拒绝未知 host）
+        # 注意：只在首次尝试时调用；若已接受过，重复执行也无害
+        "y" | & $PlinkPath -ssh -P $SshPort -l $global:SSH_USER -pw $global:SSH_PASS `
+            "$($global:SSH_HOST)" "exit" 2>&1 | Out-Null
+    } catch {
+        # 容忍失败；真正的连接失败会在后续 Invoke-SSHCommand 中再次报出
+        Write-Hint "host key 预接受过程提示：$($_.Exception.Message)"
+    }
+}
+
 function Invoke-SSHCommand {
     param([string]$Command)
-    
-    if (-not (Test-Command "sshpass")) {
-        throw "未安装 sshpass，无法非交互登录"
-    }
     
     if ([string]::IsNullOrEmpty($global:SSH_PASS)) {
         throw "SSH 密码未设置，请先完成 Collect-UserInput"
     }
     
-    # sshpass -e 从环境变量 SSHPASS 读取密码；
-    # 必须在调用前设置，否则 sshpass 会报 "no password provided"
-    $prevSshpass = $env:SSHPASS
-    $env:SSHPASS = $global:SSH_PASS
-    try {
-        # 使用原生参数数组调用（PowerShell 7 推荐方式），避免 Invoke-Expression
-        # 带来的引号/特殊字符注入；stderr 重定向到 stdout 便于抓取错误信息
-        $result = & sshpass -e ssh `
-            -o StrictHostKeyChecking=no `
-            -o UserKnownHostsFile=/dev/null `
-            -p $global:SSH_PORT `
-            "$($global:SSH_USER)@$($global:SSH_HOST)" `
+    # ---- 方案 A：plink.exe（首选） ----
+    $plinkPath = Get-PlinkPath
+    if ($plinkPath) {
+        # -batch: 禁用所有交互提示（密码错误/host key 变化等情况直接失败而不是阻塞）
+        # -ssh -P port -l user -pw pass host cmd
+        $result = & $plinkPath -ssh -batch `
+            -P $global:SSH_PORT `
+            -l $global:SSH_USER `
+            -pw $global:SSH_PASS `
+            "$($global:SSH_HOST)" `
             $Command 2>&1
         return $result
-    } finally {
-        # 恢复原始 SSHPASS，避免密码泄漏到后续子进程
-        if ($null -eq $prevSshpass) {
-            Remove-Item Env:SSHPASS -ErrorAction SilentlyContinue
-        } else {
-            $env:SSHPASS = $prevSshpass
+    }
+    
+    # ---- 方案 B：sshpass 兜底（不推荐在 Windows 使用） ----
+    if (Test-Command "sshpass") {
+        $prevSshpass = $env:SSHPASS
+        $env:SSHPASS = $global:SSH_PASS
+        try {
+            $result = & sshpass -e ssh `
+                -o StrictHostKeyChecking=no `
+                -o UserKnownHostsFile=/dev/null `
+                -p $global:SSH_PORT `
+                "$($global:SSH_USER)@$($global:SSH_HOST)" `
+                $Command 2>&1
+            return $result
+        } finally {
+            if ($null -eq $prevSshpass) {
+                Remove-Item Env:SSHPASS -ErrorAction SilentlyContinue
+            } else {
+                $env:SSHPASS = $prevSshpass
+            }
         }
     }
+    
+    throw "未找到可用的 SSH 客户端：请安装 PuTTY（choco install putty -y）获取 plink.exe"
 }
 
 function Test-SSHConnection {
@@ -940,19 +1022,54 @@ function Test-SSHConnection {
 
 # ---------------------------------------------------------------------------
 # 模块：Windows 凭据管理
+# 设计说明：
+#   早期版本使用 PowerShell Gallery 上的第三方模块 CredentialManager 提供的
+#   Get-StoredCredential / Set-StoredCredential，但该模块并非系统内置，
+#   默认 PowerShell 环境下会报 "term not recognized"。
+#
+#   为最大化兼容性（任何干净的 Windows 10/11 + PowerShell 5.1/7 都能工作），
+#   改用 Windows 原生组合方案：
+#     1) 用 DPAPI（System.Security.Cryptography.ProtectedData）将密码加密
+#        存储为文件，只有同一 Windows 用户在同一台机器上才能解密（CurrentUser 作用域）
+#     2) 同时调用内置 cmdkey.exe 在"凭据管理器"里注册一个可见条目，
+#        方便用户通过"控制面板 -> 凭据管理器 -> Windows 凭据"查看和删除
+#   两者失败时互相独立降级，不影响主流程。
 # ---------------------------------------------------------------------------
+function Get-CredentialFilePath {
+    param([string]$Target)
+    $credDir = Join-Path $STATE_DIR "credentials"
+    if (-not (Test-Path $credDir)) {
+        New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+    }
+    # 文件名中不能出现 @ : \ / 等特殊字符，做简单替换
+    $safeName = $Target -replace '[^a-zA-Z0-9_.-]', '_'
+    return Join-Path $credDir "$safeName.cred"
+}
+
 function Get-WindowsCredential {
     param([string]$Target)
     
     try {
-        $cred = Get-StoredCredential -Target $Target -ErrorAction SilentlyContinue
-        # 不要写 `return if (...) {...} else {...}`，PowerShell 会把 if 当独立语句报错
-        if ($cred) {
-            return $cred.GetNetworkCredential().Password
-        } else {
+        $credFile = Get-CredentialFilePath -Target $Target
+        if (-not (Test-Path $credFile)) {
             return $null
         }
+        
+        # 使用 DPAPI 解密（CurrentUser 作用域，只有保存时的那个 Windows 用户能解密）
+        Add-Type -AssemblyName System.Security
+        $encryptedBase64 = Get-Content -Path $credFile -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($encryptedBase64)) {
+            return $null
+        }
+        $encryptedBytes = [Convert]::FromBase64String($encryptedBase64.Trim())
+        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            $encryptedBytes,
+            $null,
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        return [System.Text.Encoding]::UTF8.GetString($plainBytes)
     } catch {
+        Write-Warn "读取已保存凭据失败，将要求重新输入密码: $($_.Exception.Message)"
         return $null
     }
 }
@@ -960,12 +1077,31 @@ function Get-WindowsCredential {
 function Set-WindowsCredential {
     param([string]$Target, [string]$Password)
     
+    # 1) DPAPI 加密落盘（主存储，保证能回读真实密码）
     try {
-        $secure = ConvertTo-SecureString $Password -AsPlainText -Force
-        $cred = New-Object System.Management.Automation.PSCredential($Target, $secure)
-        Set-StoredCredential -Target $Target -Credential $cred -Persist LocalMachine
+        Add-Type -AssemblyName System.Security
+        $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($Password)
+        $encryptedBytes = [System.Security.Cryptography.ProtectedData]::Protect(
+            $plainBytes,
+            $null,
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        $encryptedBase64 = [Convert]::ToBase64String($encryptedBytes)
+        
+        $credFile = Get-CredentialFilePath -Target $Target
+        Set-Content -Path $credFile -Value $encryptedBase64 -Encoding UTF8 -NoNewline
+        Write-Ok "凭据已加密保存: $credFile"
     } catch {
-        Write-Warn "Windows 凭据保存失败: $($_.Exception.Message)"
+        Write-Warn "Windows 凭据加密保存失败: $($_.Exception.Message)"
+    }
+    
+    # 2) 同时在"Windows 凭据管理器"注册可视条目（便于用户管理，失败不影响主流程）
+    try {
+        # /generic 通用凭据，/user 用户标签，/pass 密码本身
+        # 注意：cmdkey 参数必须用 = 形式，且整体作为单一字符串传入更稳
+        $null = & cmdkey.exe /generic:$Target /user:$Target /pass:$Password 2>&1
+    } catch {
+        # 不打扰主流程，仅 debug 级别提示
     }
 }
 
