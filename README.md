@@ -29,6 +29,8 @@
 
 ## 🚀 快速开始
 
+### 🍎 macOS / Linux 版本
+
 ```bash
 # 1. 克隆项目
 git clone https://github.com/chenp0401/obsidian2linux.git
@@ -39,6 +41,15 @@ chmod +x obsidian-sync.sh
 
 # 3. 运行交互式向导
 ./obsidian-sync.sh
+```
+
+### 🪟 Windows 版本
+
+请查看 [Windows 版本文档](README-Windows.md) 获取完整的 PowerShell 使用说明。
+
+```powershell
+# 以管理员权限运行 PowerShell，然后执行：
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
 ```
 
 首次运行示例流程：
