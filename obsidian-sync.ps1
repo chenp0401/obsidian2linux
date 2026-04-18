@@ -2519,8 +2519,37 @@ function Stop-SSHTunnel {
 # 等待远端 API 响应 pong
 function Wait-RemoteApiReady {
     Write-Info "验证远端 Syncthing API 可达..."
+    
+    # 0) 先在服务器端确认 syncthing 已监听 127.0.0.1:8384
+    #    避免 plink 转发到一个不存在的服务导致客户端一直 connection refused
+    $serverCheckScript = @'
+if ss -tln 2>/dev/null | grep -qE '127\.0\.0\.1:8384|\*:8384|:::8384'; then
+    echo "LISTEN=1"
+else
+    echo "LISTEN=0"
+    echo "--- syncthing 服务状态 ---"
+    systemctl status syncthing@root --no-pager 2>&1 | head -20 || true
+    echo "--- 最近 20 行日志 ---"
+    journalctl -u syncthing@root -n 20 --no-pager 2>&1 || true
+fi
+'@
+    $serverCheck = (Invoke-SSHScript -Script $serverCheckScript).Output
+    if ($serverCheck -notmatch "LISTEN=1") {
+        Write-Warn "远端 syncthing 尚未监听 8384 端口，服务器诊断信息："
+        foreach ($line in ($serverCheck -split "`n")) {
+            if ($line.Trim()) { Write-Hint $line }
+        }
+        Write-Info "等待 10 秒让 syncthing 初始化..."
+        Start-Sleep -Seconds 10
+    } else {
+        Write-Hint "远端 8384 端口监听正常"
+    }
+    
+    # 1) 开始轮询 API（60 秒）
     $waited = 0
-    while ($waited -lt 30) {
+    $maxWait = 60
+    $lastErr = ""
+    while ($waited -lt $maxWait) {
         try {
             $r = Invoke-SyncthingApi -Method GET -Url "$($global:REMOTE_API_URL)/rest/system/ping" -ApiKey $global:REMOTE_API_KEY -Retries 1 -TimeoutSec 3
             # ping 成功返回 {"ping":"pong"} 或包含 "pong" 字样
@@ -2529,11 +2558,28 @@ function Wait-RemoteApiReady {
                 Write-Ok "远端 API 响应正常"
                 return
             }
-        } catch { }
+            $lastErr = "API 返回非 pong 响应：$rStr"
+        } catch {
+            $lastErr = $_.Exception.Message
+            # 每 10 秒打印一次当前错误，避免用户盲等
+            if (($waited % 10) -eq 0 -and $waited -gt 0) {
+                Write-Hint "已等待 ${waited}s，最近一次错误：$lastErr"
+            }
+        }
         Start-Sleep -Seconds 1
         $waited++
     }
-    throw "远端 API 在 30 秒内未能响应，请检查 syncthing 服务状态"
+    
+    # 失败时打印完整诊断信息
+    Write-Warn "远端 API 在 $maxWait 秒内未能响应"
+    Write-Hint "最后一次错误：$lastErr"
+    Write-Hint "当前请求地址：$($global:REMOTE_API_URL)/rest/system/ping"
+    Write-Hint "当前 API Key 长度：$($global:REMOTE_API_KEY.Length)"
+    Write-Hint "诊断建议："
+    Write-Hint "  1) 本地手动测试：curl.exe -v http://127.0.0.1:$REMOTE_API_LOCAL_PORT/rest/system/ping"
+    Write-Hint "  2) 服务器直连测试：ssh $($global:SSH_USER)@$($global:SSH_HOST) `"curl -s -H 'X-API-Key: $($global:REMOTE_API_KEY)' http://127.0.0.1:8384/rest/system/ping`""
+    Write-Hint "  3) 查看远端 GUI 绑定地址：ssh $($global:SSH_USER)@$($global:SSH_HOST) `"grep -E '<gui|<address' $($global:REMOTE_CONFIG_XML)`""
+    throw "远端 API 在 $maxWait 秒内未能响应，请根据上方诊断信息排查"
 }
 
 # 通过 REST 更新远端 GUI 用户名/密码（Syncthing 会自动 bcrypt）
