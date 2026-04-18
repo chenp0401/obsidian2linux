@@ -2572,8 +2572,22 @@ function Invoke-RemoteApiTunnelSetup {
     
     $global:REMOTE_GUI_USER = $guiUser
     $global:REMOTE_GUI_PASS = $guiPass
-    Write-Info "远端 GUI 凭证：user=$guiUser  password=$guiPass"
-    Write-Warn "该密码仅本次会话展示一次，请妥善保存（如需找回可通过 SSH 查看 config.xml）"
+    
+    # 持久化 GUI 密码到 DPAPI 加密文件（只有同一 Windows 用户能读回来）
+    # 目标命名：obsidian-sync-gui-<host>，避免和 SSH 凭据冲突
+    $guiCredTarget = "obsidian-sync-gui-$($global:SSH_HOST)"
+    $saved = Set-WindowsCredential -Target $guiCredTarget -Username $guiUser -Password $guiPass
+    
+    Write-Info "远端 GUI 凭证："
+    Write-Hint "  URL      : http://$($global:SSH_HOST):8384"
+    Write-Hint "  用户名   : $guiUser"
+    Write-Hint "  密码     : $guiPass"
+    if ($saved) {
+        $credFile = Get-CredentialFilePath -Target $guiCredTarget
+        Write-Hint "  ↳ 已加密保存到: $credFile"
+        Write-Hint "  ↳ 想再次查看密码，运行：.\show-gui-password.ps1"
+    }
+    Write-Warn "该密码仅在本次会话明文展示一次，请妥善保存"
 }
 
 # ---------------------------------------------------------------------------
