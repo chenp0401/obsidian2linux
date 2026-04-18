@@ -2274,6 +2274,309 @@ function Deploy-RemoteSyncthing {
 }
 
 # ---------------------------------------------------------------------------
+# 模块：syncthing_api —— REST 调用封装（步骤 3 及以后共用）
+# 设计说明：
+#   - sh 版统一用 curl，Windows 我们用 PowerShell 原生 Invoke-WebRequest，
+#     无需额外依赖 jq/curl
+#   - 支持 HTTPS 自签证书（Syncthing 默认自签；用反射设置
+#     ServerCertificateValidationCallback，兼容 PS 5.1/7）
+#   - 内置 3 次重试（对应 sh 版 http_call 的 retry 逻辑）
+#   - Body 直接收 [string] JSON，不走临时文件（PS Invoke-WebRequest 原生支持）
+# ---------------------------------------------------------------------------
+
+# 首次调用时一次性忽略自签证书（Syncthing 启用 TLS 时走 https://127.0.0.1:18384）
+function Disable-CertificateValidation {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy {
+    public static bool Validate(object s, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) { return true; }
+}
+"@
+    }
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [TrustAllCertsPolicy]::Validate
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11 -bor [System.Net.SecurityProtocolType]::Tls
+}
+
+# Invoke-SyncthingApi：REST 底层封装（等价 sh 版 http_call）
+# 参数：
+#   -Method  GET/POST/PUT/DELETE/PATCH
+#   -Url     完整 URL（含 http:// 或 https://）
+#   -ApiKey  X-API-Key 头的值（可选，健康检查可不传）
+#   -Body    JSON 字符串（可选，POST/PUT 用）
+#   -Retries 重试次数，默认 3
+#   -TimeoutSec 单次请求超时，默认 10
+# 返回：PSObject（JSON 反序列化后的对象）或原始字符串（若非 JSON）
+function Invoke-SyncthingApi {
+    param(
+        [Parameter(Mandatory=$true)][string]$Method,
+        [Parameter(Mandatory=$true)][string]$Url,
+        [string]$ApiKey,
+        [string]$Body,
+        [int]$Retries = 3,
+        [int]$TimeoutSec = 10
+    )
+    Disable-CertificateValidation
+    
+    $headers = @{}
+    if ($ApiKey) { $headers["X-API-Key"] = $ApiKey }
+    
+    $attempt = 0
+    $lastErr = $null
+    while ($attempt -lt $Retries) {
+        $attempt++
+        try {
+            $params = @{
+                Method       = $Method
+                Uri          = $Url
+                Headers      = $headers
+                TimeoutSec   = $TimeoutSec
+                UseBasicParsing = $true
+                ErrorAction  = 'Stop'
+            }
+            if ($Body) {
+                $params.ContentType = "application/json"
+                $params.Body        = $Body
+            }
+            $response = Invoke-WebRequest @params
+            $content = $response.Content
+            # 尝试解析 JSON，失败则返回原文
+            try {
+                return $content | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                return $content
+            }
+        } catch {
+            $lastErr = $_.Exception.Message
+            if ($attempt -lt $Retries) {
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+    throw "HTTP $Method $Url 失败（重试 $Retries 次）: $lastErr"
+}
+
+# 远端 API 调用（经 SSH 隧道，走 127.0.0.1:18384）
+function Invoke-RemoteApi {
+    param(
+        [Parameter(Mandatory=$true)][string]$Method,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [string]$Body,
+        [int]$Retries = 3
+    )
+    if ([string]::IsNullOrEmpty($global:REMOTE_API_KEY)) {
+        throw "REMOTE_API_KEY 为空，请先完成步骤 2 的 Read-RemoteIdentity"
+    }
+    Invoke-SyncthingApi -Method $Method -Url "$REMOTE_API_URL$Path" -ApiKey $global:REMOTE_API_KEY -Body $Body -Retries $Retries
+}
+
+# 本地 API 调用（本机 syncthing，127.0.0.1:8384）
+function Invoke-LocalApi {
+    param(
+        [Parameter(Mandatory=$true)][string]$Method,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [string]$Body,
+        [int]$Retries = 3
+    )
+    if ([string]::IsNullOrEmpty($global:LOCAL_API_KEY)) {
+        throw "LOCAL_API_KEY 为空，请先完成步骤 4 的本地 Syncthing 安装"
+    }
+    Invoke-SyncthingApi -Method $Method -Url "$LOCAL_API_URL$Path" -ApiKey $global:LOCAL_API_KEY -Body $Body -Retries $Retries
+}
+
+# 生成安全随机字符串（字母+数字，长度 N）
+function New-RandomString {
+    param([int]$Length = 20)
+    $chars = [char[]]'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    # 用 System.Security.Cryptography.RandomNumberGenerator 保证密码强度
+    $bytes = New-Object byte[] $Length
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($b in $bytes) {
+        [void]$sb.Append($chars[$b % $chars.Length])
+    }
+    return $sb.ToString()
+}
+
+# ---------------------------------------------------------------------------
+# 模块：remote-tunnel —— 远端 API 通道与 GUI 凭证（步骤 3/8）
+# ---------------------------------------------------------------------------
+
+# 建立 SSH 端口转发：127.0.0.1:$REMOTE_API_LOCAL_PORT -> 远端 127.0.0.1:8384
+function New-SSHTunnel {
+    Write-Info "建立 SSH 端口转发 127.0.0.1:$REMOTE_API_LOCAL_PORT -> 远端 :8384 ..."
+    
+    # 1) 端口占用则先清理
+    $occupied = $false
+    try {
+        $null = Get-NetTCPConnection -LocalPort $REMOTE_API_LOCAL_PORT -State Listen -ErrorAction Stop
+        $occupied = $true
+    } catch { }
+    
+    if ($occupied) {
+        Write-Warn "本地端口 $REMOTE_API_LOCAL_PORT 已占用；尝试结束旧隧道..."
+        # 尝试 kill 已记录的旧隧道 Process
+        if ($global:SSH_TUNNEL_PROCESS -and -not $global:SSH_TUNNEL_PROCESS.HasExited) {
+            try { $global:SSH_TUNNEL_PROCESS.Kill() } catch { }
+        }
+        # 再按命令行特征兜底清理：plink 进程 + 含 "-L 18384:" 参数
+        Get-CimInstance Win32_Process -Filter "Name='plink.exe'" -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -match "-L\s+$REMOTE_API_LOCAL_PORT`:127\.0\.0\.1:8384"
+        } | ForEach-Object {
+            Write-Hint "杀掉残留 plink PID=$($_.ProcessId)"
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Seconds 1
+    }
+    
+    # 2) 启动新隧道（plink -N -L 本地端口:远端地址）
+    #    -N: 不执行远端命令（纯转发）
+    #    -ssh -batch: 非交互、已预接收 host key
+    #    -pw: 直接传密码（ps1 里 plink 已经验证过这条路能工作）
+    $plinkPath = Get-PlinkPath
+    if (-not $plinkPath) { throw "未找到 plink.exe" }
+    
+    $plinkArgs = @(
+        "-ssh", "-batch", "-N",
+        "-P", $global:SSH_PORT,
+        "-l", $global:SSH_USER,
+        "-pw", $global:SSH_PASS,
+        "-L", "$($REMOTE_API_LOCAL_PORT):127.0.0.1:8384",
+        $global:SSH_HOST
+    )
+    
+    $proc = Start-Process -FilePath $plinkPath -ArgumentList $plinkArgs `
+                          -WindowStyle Hidden -PassThru `
+                          -RedirectStandardOutput ([System.IO.Path]::GetTempFileName()) `
+                          -RedirectStandardError  ([System.IO.Path]::GetTempFileName())
+    $global:SSH_TUNNEL_PROCESS = $proc
+    
+    # 3) 等待端口实际监听（最多 10 秒）
+    $waited = 0
+    $listening = $false
+    while ($waited -lt 10) {
+        Start-Sleep -Milliseconds 500
+        $waited += 1
+        try {
+            $null = Get-NetTCPConnection -LocalPort $REMOTE_API_LOCAL_PORT -State Listen -ErrorAction Stop
+            $listening = $true
+            break
+        } catch { }
+        # 进程提前挂掉则直接失败
+        if ($proc.HasExited) {
+            throw "plink 隧道进程提前退出（ExitCode=$($proc.ExitCode)），请检查 SSH 连通性"
+        }
+    }
+    
+    if (-not $listening) {
+        try { $proc.Kill() } catch { }
+        throw "SSH 隧道建立失败：10 秒内端口 $REMOTE_API_LOCAL_PORT 未进入监听状态"
+    }
+    
+    Write-Ok "SSH 隧道建立成功（plink PID=$($proc.Id)）"
+    
+    # 4) 探测远端 GUI 是否启用 TLS（影响 http/https 协议）
+    $tlsScriptTemplate = @'
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+if $sudo_cmd grep -qE '<gui[^>]+tls="true"' "__CFG__" 2>/dev/null; then
+    echo "TLS=1"
+else
+    echo "TLS=0"
+fi
+'@
+    $tlsScript = $tlsScriptTemplate.Replace("__CFG__", $global:REMOTE_CONFIG_XML)
+    $tlsOut = (Invoke-SSHScript -Script $tlsScript).Output
+    if ($tlsOut -match "TLS=1") {
+        $global:REMOTE_API_URL = "https://127.0.0.1:$REMOTE_API_LOCAL_PORT"
+        # 覆盖脚本级变量（给 Invoke-RemoteApi 用）
+        Set-Variable -Name REMOTE_API_URL -Value $global:REMOTE_API_URL -Scope Script
+        Write-Info "检测到远端 GUI 启用了 TLS，切换为 HTTPS 访问"
+    }
+}
+
+# 关闭 SSH 隧道（在退出或出错时调用）
+function Stop-SSHTunnel {
+    if ($global:SSH_TUNNEL_PROCESS) {
+        try {
+            if (-not $global:SSH_TUNNEL_PROCESS.HasExited) {
+                $global:SSH_TUNNEL_PROCESS.Kill()
+                Write-Info "已关闭 SSH 端口转发（PID=$($global:SSH_TUNNEL_PROCESS.Id)）"
+            }
+        } catch { }
+        $global:SSH_TUNNEL_PROCESS = $null
+    }
+    # 兜底：按命令行特征清理任何残留
+    Get-CimInstance Win32_Process -Filter "Name='plink.exe'" -ErrorAction SilentlyContinue | Where-Object {
+        $_.CommandLine -match "-L\s+$REMOTE_API_LOCAL_PORT`:127\.0\.0\.1:8384"
+    } | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 等待远端 API 响应 pong
+function Wait-RemoteApiReady {
+    Write-Info "验证远端 Syncthing API 可达..."
+    $waited = 0
+    while ($waited -lt 30) {
+        try {
+            $r = Invoke-SyncthingApi -Method GET -Url "$($global:REMOTE_API_URL)/rest/system/ping" -ApiKey $global:REMOTE_API_KEY -Retries 1 -TimeoutSec 3
+            # ping 成功返回 {"ping":"pong"} 或包含 "pong" 字样
+            $rStr = if ($r -is [string]) { $r } else { ($r | ConvertTo-Json -Compress) }
+            if ($rStr -match "pong") {
+                Write-Ok "远端 API 响应正常"
+                return
+            }
+        } catch { }
+        Start-Sleep -Seconds 1
+        $waited++
+    }
+    throw "远端 API 在 30 秒内未能响应，请检查 syncthing 服务状态"
+}
+
+# 通过 REST 更新远端 GUI 用户名/密码（Syncthing 会自动 bcrypt）
+function Set-RemoteGuiCredentials {
+    param(
+        [Parameter(Mandatory=$true)][string]$User,
+        [Parameter(Mandatory=$true)][string]$Password
+    )
+    Write-Info "配置服务器 GUI 访问凭证（用户名：$User）..."
+    
+    # 先取当前 gui 配置
+    $gui = Invoke-RemoteApi -Method GET -Path "/rest/config/gui"
+    if (-not $gui) { throw "无法获取远端 GUI 配置" }
+    
+    # 修改字段
+    $gui | Add-Member -NotePropertyName user -NotePropertyValue $User -Force
+    $gui | Add-Member -NotePropertyName password -NotePropertyValue $Password -Force
+    $gui | Add-Member -NotePropertyName address -NotePropertyValue "127.0.0.1:8384" -Force
+    
+    $bodyJson = $gui | ConvertTo-Json -Depth 20 -Compress
+    $null = Invoke-RemoteApi -Method PUT -Path "/rest/config/gui" -Body $bodyJson
+    Write-Ok "远端 GUI 凭证已更新"
+}
+
+# 步骤 3 主入口
+function Invoke-RemoteApiTunnelSetup {
+    Write-Step "步骤 3/8：建立远端 API 通道与 GUI 凭证"
+    
+    New-SSHTunnel
+    Wait-RemoteApiReady
+    
+    # 生成随机 GUI 凭证
+    $guiUser = "obsidian_sync"
+    $guiPass = New-RandomString -Length 20
+    Set-RemoteGuiCredentials -User $guiUser -Password $guiPass
+    
+    $global:REMOTE_GUI_USER = $guiUser
+    $global:REMOTE_GUI_PASS = $guiPass
+    Write-Info "远端 GUI 凭证：user=$guiUser  password=$guiPass"
+    Write-Warn "该密码仅本次会话展示一次，请妥善保存（如需找回可通过 SSH 查看 config.xml）"
+}
+
+# ---------------------------------------------------------------------------
 # 模块：Windows 凭据管理
 # 设计说明：
 #   早期版本使用 PowerShell Gallery 上的第三方模块 CredentialManager 提供的
@@ -2400,13 +2703,20 @@ function Main {
         # 步骤 2/8：服务器端 Syncthing 部署
         Deploy-RemoteSyncthing
         
+        # 步骤 3/8：建立远端 API 通道与 GUI 凭证
+        Invoke-RemoteApiTunnelSetup
+        
         Write-Host ""
-        Write-Warn "步骤 3/8 至 8/8 尚在实现中（本地 Syncthing 安装、API 隐道、设备配对、Vault 选择、文件夹共享、总结）"
-        Write-Hint "服务器端已配置完毕，Web UI：http://$($global:SSH_HOST):8384（需添加本地设备后才能同步）"
+        Write-Warn "步骤 4/8 至 8/8 尚在实现中（本地 Syncthing 安装、设备配对、Vault 选择、文件夹共享、总结）"
+        Write-Hint "服务器端已配置完毕，Web UI：http://$($global:SSH_HOST):8384"
+        Write-Hint "  用户名：$($global:REMOTE_GUI_USER)   密码：$($global:REMOTE_GUI_PASS)"
         
     } catch {
         Write-Err "执行失败: $($_.Exception.Message)"
         exit 1
+    } finally {
+        # 确保隧道被清理（即便后续步骤出错也不会遗留 plink 进程）
+        Stop-SSHTunnel
     }
 }
 
