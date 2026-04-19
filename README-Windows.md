@@ -29,6 +29,27 @@
    - 输入服务器连接信息
    - 自动部署 Syncthing 同步环境
 
+### 🔧 同步问题诊断
+
+如果遇到同步问题，可以使用诊断模式快速排查：
+
+```powershell
+# 运行同步问题诊断
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 diagnose
+
+# 诊断特定文件夹
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 diagnose -FolderId Win10-vaulte-4l5us
+```
+
+诊断功能会检查：
+- ✅ 本地Syncthing服务状态
+- ✅ 远程设备连接状态
+- ✅ 端口连通性（22000端口）
+- ✅ 文件夹同步状态
+- ✅ 错误信息分析
+
+详细诊断指南请参考：[SYNC-DIAGNOSIS.md](SYNC-DIAGNOSIS.md)
+
 ## 📋 功能特性
 
 ### ✅ 已实现功能
@@ -126,6 +147,28 @@ ping community.chocolatey.org
 refreshenv
 # 或重启 PowerShell
 ```
+
+#### 5. 同步问题诊断
+如果文件同步失败，使用诊断模式快速排查：
+
+```powershell
+# 运行完整诊断
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 diagnose
+
+# 检查端口连通性
+Test-NetConnection 43.163.113.77 -Port 22000
+
+# 检查本地Syncthing服务
+Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/system/ping" -Method GET
+```
+
+**常见同步问题：**
+- 🔴 端口22000无法连通 → 检查服务器防火墙和安全组设置
+- 🔴 本地Syncthing服务未启动 → 查看 `C:\Users\陈洁\.obsidian-sync\local-syncthing.log`
+- 🔴 远程设备未连接 → 检查网络连接和端口设置
+- 🔴 文件夹状态异常 → 查看错误信息和同步统计
+
+详细诊断指南请参考：[SYNC-DIAGNOSIS.md](SYNC-DIAGNOSIS.md)
 
 ### 日志文件
 脚本运行日志保存在：

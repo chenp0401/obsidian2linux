@@ -167,8 +167,32 @@ $global:REMOTE_HOME = ""
 $global:REMOTE_CONFIG_DIR = ""
 $global:REMOTE_CONFIG_XML = ""
 
+# 本地 Syncthing 上下文（由步骤 4 填充）
+#   - 安装目录放 LOCALAPPDATA（免管理员），和 Chocolatey 的 C:\ProgramData\chocolatey 解耦
+#   - 配置目录走官方默认 %LOCALAPPDATA%\Syncthing，避免自己发明路径导致未来升级/迁移困难
+#   - 版本号与服务器保持一致（v2.x），否则 syncthing v1 <-> v2 协议无法互联
+$LOCAL_SYNCTHING_VERSION = "v2.0.16"
+$LOCAL_SYNCTHING_HOME = Join-Path $env:LOCALAPPDATA "obsidian-sync\syncthing"
+$LOCAL_SYNCTHING_EXE = Join-Path $LOCAL_SYNCTHING_HOME "syncthing.exe"
+$LOCAL_SYNCTHING_CONFIG_DIR = Join-Path $env:LOCALAPPDATA "Syncthing"
+$LOCAL_SYNCTHING_CONFIG_XML = Join-Path $LOCAL_SYNCTHING_CONFIG_DIR "config.xml"
+$LOCAL_SYNCTHING_LOG = Join-Path $STATE_DIR "local-syncthing.log"
+$LOCAL_SYNCTHING_PID_FILE = Join-Path $STATE_DIR "local-syncthing.pid"
+$global:LOCAL_SYNCTHING_PROCESS = $null
+
 # 回滚栈
 $global:ROLLBACK_STACK = @()
+
+# 步骤 6/8 填充：用户选中的本地 Vault 绝对路径数组
+$global:SELECTED_VAULTS = @()
+
+# 步骤 6’7 填充：本次 folder 要共享给哪些远端设备（device ID）
+# 默认至少包含本次目标服务器 REMOTE_DEVICE_ID，如本地已配对多台远端则可在步骤 7 追加勾选
+$global:SELECTED_REMOTE_DEVICES = @()
+
+# 步骤 7/8 填充：本次成功建立的共享 folder 清单
+# 每项格式：[pscustomobject]@{ FolderId=...; LocalPath=...; RemotePath=...; Label=... }
+$global:SHARED_FOLDERS = @()
 
 # ---------------------------------------------------------------------------
 # 模块：ui —— 彩色日志与交互
@@ -803,9 +827,14 @@ function Check-Dependencies {
     $required = @("ssh", "curl")
     # Windows 下非交互式 SSH 首选 plink（PuTTY 套件），
     # 已在 Invoke-SSHCommand 内做了兜底；这里只作提示，不强制
+    #
+    # 可选依赖：缺失时不影响核心流程（脚本均已实现降级方案），
+    # 但若 Chocolatey 可用会提示用户"一键安装"以提升体验。
+    #   - ChocoPkg : choco 包名（留空则不提供自动安装）
+    #   - Purpose  : 缺失时的影响说明（显示给用户，帮助其决定是否安装）
     $optional = @(
-        @{Name="jq"; Description="JSON 解析"},
-        @{Name="fzf"; Description="目录多选 TUI"}
+        @{Name="jq";  Description="JSON 解析";   ChocoPkg="jq";  Purpose="用于解析 Syncthing REST API 的 JSON 响应；缺失时脚本会回退到 PowerShell 原生 ConvertFrom-Json（功能等价）"},
+        @{Name="fzf"; Description="目录多选 TUI"; ChocoPkg="fzf"; Purpose="步骤 6/8 Vault 多选时提供带模糊搜索的 TUI 多选界面；缺失时降级为数字菜单（功能可用但体验较差）"}
     )
     
     $missing = @()
@@ -916,12 +945,61 @@ function Check-Dependencies {
     foreach ($item in $optional) {
         if (Test-Command $item.Name) {
             Write-Ok "已安装：$($item.Name)（$($item.Description)）"
-        } else {
-            Write-Warn "未检测到 $($item.Name)（$($item.Description)）"
-            switch ($item.Name) {
-                "jq" { Write-Hint "  - 安装: choco install jq -y" }
-                "fzf" { Write-Hint "  - 安装: choco install fzf -y" }
+            continue
+        }
+
+        Write-Warn "未检测到 $($item.Name)（$($item.Description)）"
+        if ($item.Purpose) {
+            Write-Hint "用途：$($item.Purpose)"
+        }
+
+        # 没有 Chocolatey 或未指定 ChocoPkg，只做提示、不尝试自动装
+        $hasChoco = Test-Command "choco"
+        if ((-not $hasChoco) -or [string]::IsNullOrWhiteSpace($item.ChocoPkg)) {
+            if (-not [string]::IsNullOrWhiteSpace($item.ChocoPkg)) {
+                Write-Hint "安装: choco install $($item.ChocoPkg) -y（当前未检测到 choco，可手动安装）"
             }
+            continue
+        }
+
+        # 交互确认后尝试通过 Chocolatey 安装；复用现成的重试包装器
+        if (-not (Confirm "是否立即通过 Chocolatey 安装 $($item.Name)（可选，不装也能用）？" "Y")) {
+            Write-Hint "已跳过安装，将自动降级（后续流程不受影响）"
+            continue
+        }
+
+        $installed = $false
+        try {
+            $result = Invoke-ChocoInstallWithRetry -PackageName $item.ChocoPkg -MaxRetries 3 -InitialDelaySec 3
+            if ($result.Success) {
+                # 刷新 PATH 让当前进程立即能调用到 shim
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                $chocoBin = "$env:ProgramData\chocolatey\bin"
+                if ((Test-Path $chocoBin) -and ($env:Path -notlike "*$chocoBin*")) {
+                    $env:Path = "$chocoBin;$env:Path"
+                }
+
+                if (Test-Command $item.Name) {
+                    Write-Ok "$($item.Name) 安装成功并已就绪"
+                    $installed = $true
+                } else {
+                    Write-Warn "choco 报安装成功但 $($item.Name) 仍未找到，将继续使用降级方案"
+                }
+            } else {
+                if ($result.IsNetworkError) {
+                    Write-Warn "Chocolatey 源在重试 $($result.Attempts) 次后仍不可访问（常见于 503/网络抖动）"
+                } elseif ($result.IsChocoBroken) {
+                    Write-Warn "Chocolatey 包索引损坏，请稍后重启脚本触发自检修复"
+                } else {
+                    Write-Warn "$($item.Name) 安装失败（重试 $($result.Attempts) 次）"
+                }
+            }
+        } catch {
+            Write-Warn "choco install $($item.ChocoPkg) 流程异常：$($_.Exception.Message)"
+        }
+
+        if (-not $installed) {
+            Write-Hint "$($item.Name) 未就绪，后续流程将自动走降级方案（不影响核心功能）"
         }
     }
 }
@@ -934,7 +1012,11 @@ function Invoke-DownloadWithProgress {
         [Parameter(Mandatory=$true)][string]$Url,
         [Parameter(Mandatory=$true)][string]$OutFile,
         [int]$TimeoutSec = 30,
-        [string]$Activity = "下载中"
+        [string]$Activity = "下载中",
+        # 速度守护：在 StallWindowSec 秒的窗口内，若平均速度低于 MinSpeedKBps 则放弃本次连接。
+        # 默认 0/0 表示关闭此保护（保持旧行为）。
+        [int]$MinSpeedKBps = 0,
+        [int]$StallWindowSec = 15
     )
     
     $request = [System.Net.HttpWebRequest]::Create($Url)
@@ -961,6 +1043,10 @@ function Invoke-DownloadWithProgress {
     $totalRead = 0
     $lastUpdate = [DateTime]::Now
     $startTime = [DateTime]::Now
+    # 速度守护用：记录 StallWindowSec 秒前的已下载字节数
+    $stallCheckpointTime  = [DateTime]::Now
+    $stallCheckpointBytes = 0
+    $abortReason = $null
     
     try {
         while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
@@ -982,6 +1068,21 @@ function Invoke-DownloadWithProgress {
                 }
                 $lastUpdate = $now
             }
+
+            # 速度守护：每到达 StallWindowSec 窗口，评估一次窗口内平均速度
+            if ($MinSpeedKBps -gt 0) {
+                $winSec = ($now - $stallCheckpointTime).TotalSeconds
+                if ($winSec -ge $StallWindowSec) {
+                    $winBytes = $totalRead - $stallCheckpointBytes
+                    $winSpeedKB = if ($winSec -gt 0) { [Math]::Round($winBytes / 1KB / $winSec, 1) } else { 0 }
+                    if ($winSpeedKB -lt $MinSpeedKBps) {
+                        $abortReason = "窗口内速度 $winSpeedKB KB/s < 阈值 $MinSpeedKBps KB/s（已等待 $([int]$winSec)s），放弃该镜像"
+                        break
+                    }
+                    $stallCheckpointTime  = $now
+                    $stallCheckpointBytes = $totalRead
+                }
+            }
         }
     } finally {
         $fileStream.Close()
@@ -990,6 +1091,12 @@ function Invoke-DownloadWithProgress {
         Write-Progress -Activity $Activity -Completed
     }
     
+    if ($abortReason) {
+        # 删除半成品，向上层抛出让 caller 走镜像降级
+        try { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue } catch {}
+        throw $abortReason
+    }
+
     $elapsedTotal = [Math]::Round(([DateTime]::Now - $startTime).TotalSeconds, 1)
     $finalMB = [Math]::Round($totalRead / 1MB, 2)
     Write-Host "   ↳ 下载完成：$finalMB MB，用时 $elapsedTotal 秒" -ForegroundColor DarkGray
@@ -2717,6 +2824,1591 @@ function Invoke-RemoteApiTunnelSetup {
 }
 
 # ---------------------------------------------------------------------------
+# 模块：local-syncthing —— 本地 Windows Syncthing 安装与启动（步骤 4/8）
+#
+# 设计说明：
+#   - 目标版本与服务器端完全一致（$LOCAL_SYNCTHING_VERSION），保证协议兼容
+#   - 下载走多镜像降级（和步骤 2 服务器端一样：github-direct → ghfast → ghproxy），
+#     单次最长等待 60s，失败立即换下一个镜像
+#   - 不走 Windows 服务（避免 ACL/SYSTEM 账户看不到用户目录的坑），
+#     改用后台进程（Start-Process -WindowStyle Hidden），PID 写入 state 目录；
+#     这样普通用户权限即可跑起来，后续用户可自行挂计划任务开机自启
+#   - GUI 只绑 127.0.0.1:8384（本机访问），和服务器端一致
+#   - 首次启动用 `-generate` 生成 config.xml，再启动常驻进程；
+#     避免主进程启动瞬间 race 导致 config 不完整
+# ---------------------------------------------------------------------------
+
+# 判断本地 syncthing.exe 是否已就位并满足版本要求
+function Test-LocalSyncthingInstalled {
+    if (-not (Test-Path $LOCAL_SYNCTHING_EXE)) { return @{ Installed = $false; Version = "" } }
+    try {
+        $verOut = & $LOCAL_SYNCTHING_EXE --version 2>&1 | Select-Object -First 1
+        # 输出形如：syncthing v2.0.16 "Hafnium Hornet" ...
+        if ($verOut -match 'v(\d+)\.(\d+)\.(\d+)') {
+            $full = "v$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            $major = [int]$Matches[1]
+            return @{ Installed = $true; Version = $full; Major = $major }
+        }
+        return @{ Installed = $true; Version = "unknown"; Major = 0 }
+    } catch {
+        return @{ Installed = $false; Version = ""; Error = $_.Exception.Message }
+    }
+}
+
+# 下载本地 syncthing zip（多镜像降级）
+function Get-LocalSyncthingBinary {
+    $ver = $LOCAL_SYNCTHING_VERSION
+    $fileName = "syncthing-windows-amd64-$ver.zip"
+    $tmpDir = Join-Path $env:TEMP "obsidian-sync-dl"
+    if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null }
+    $zipPath = Join-Path $tmpDir $fileName
+
+    # 如果之前下载过，直接复用（zip 本身有校验，解压失败时再重下）
+    if ((Test-Path $zipPath) -and ((Get-Item $zipPath).Length -gt 1MB)) {
+        Write-Hint "已检测到本地缓存：$zipPath （$([Math]::Round((Get-Item $zipPath).Length/1MB, 2)) MB），直接复用"
+        return $zipPath
+    }
+
+    $directUrl = "https://github.com/syncthing/syncthing/releases/download/$ver/$fileName"
+    # 镜像顺序 & 最低速度阈值（单位 KB/s）：任何镜像在 15 秒窗口内平均速度低于阈值
+    # 就立刻放弃并换下一个，避免像 ghfast 那样 8KB/s 拖 20 分钟的糟糕体验。
+    $candidates = @(
+        @{ Name = "github-direct"; Url = $directUrl;                       MinKBps = 100 },
+        @{ Name = "ghproxy";       Url = "https://ghproxy.com/$directUrl";  MinKBps = 100 },
+        @{ Name = "ghfast";        Url = "https://ghfast.top/$directUrl";   MinKBps = 100 }
+    )
+
+    foreach ($c in $candidates) {
+        Write-Hint "---- 尝试 [$($c.Name)] : $($c.Url)（最低 $($c.MinKBps) KB/s，否则 15s 后放弃） ----"
+        try {
+            Invoke-DownloadWithProgress -Url $c.Url -OutFile $zipPath -TimeoutSec 60 `
+                -Activity "下载 Syncthing $ver ($($c.Name))" `
+                -MinSpeedKBps $c.MinKBps -StallWindowSec 15
+            $size = (Get-Item $zipPath).Length
+            if ($size -lt 1MB) {
+                Write-Warn "[$($c.Name)] 下载文件过小（$size 字节），疑似错误页面，丢弃重试"
+                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                continue
+            }
+            Write-Hint "[$($c.Name)] 下载成功：$zipPath（$([Math]::Round($size/1MB, 2)) MB）"
+            return $zipPath
+        } catch {
+            Write-Warn "[$($c.Name)] 下载失败：$($_.Exception.Message)"
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    throw "所有下载源均失败，无法获取 Syncthing $ver Windows 安装包"
+}
+
+# 解压 syncthing.zip 到 $LOCAL_SYNCTHING_HOME
+function Expand-LocalSyncthingBinary {
+    param([Parameter(Mandatory=$true)][string]$ZipPath)
+
+    if (-not (Test-Path $LOCAL_SYNCTHING_HOME)) {
+        New-Item -ItemType Directory -Path $LOCAL_SYNCTHING_HOME -Force | Out-Null
+    }
+
+    $tmpExtract = Join-Path $env:TEMP "obsidian-sync-extract"
+    if (Test-Path $tmpExtract) { Remove-Item $tmpExtract -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Path $tmpExtract -Force | Out-Null
+
+    Write-Hint "正在解压：$ZipPath"
+    try {
+        Expand-Archive -Path $ZipPath -DestinationPath $tmpExtract -Force
+    } catch {
+        throw "解压失败（zip 可能损坏）：$($_.Exception.Message)"
+    }
+
+    # 官方 zip 里是 syncthing-windows-amd64-vX.Y.Z/syncthing.exe 这样的子目录结构，兜底查找
+    $found = Get-ChildItem -Path $tmpExtract -Recurse -Filter "syncthing.exe" | Select-Object -First 1
+    if (-not $found) {
+        throw "解压后未找到 syncthing.exe，zip 内容异常"
+    }
+
+    Copy-Item -Path $found.FullName -Destination $LOCAL_SYNCTHING_EXE -Force
+    # 同目录下的 LICENSE / README 也拷过来（体积很小，方便溯源）
+    foreach ($extra in @("LICENSE.txt", "README.txt", "AUTHORS.txt")) {
+        $extraSrc = Join-Path $found.Directory.FullName $extra
+        if (Test-Path $extraSrc) {
+            Copy-Item -Path $extraSrc -Destination (Join-Path $LOCAL_SYNCTHING_HOME $extra) -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-Item $tmpExtract -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Ok "Syncthing 已解压到 $LOCAL_SYNCTHING_EXE"
+}
+
+# 生成本地 config.xml（首次）
+function Initialize-LocalSyncthingConfig {
+    if (Test-Path $LOCAL_SYNCTHING_CONFIG_XML) {
+        Write-Ok "本地 Syncthing 配置已存在（幂等跳过生成）：$LOCAL_SYNCTHING_CONFIG_XML"
+        return
+    }
+    if (-not (Test-Path $LOCAL_SYNCTHING_CONFIG_DIR)) {
+        New-Item -ItemType Directory -Path $LOCAL_SYNCTHING_CONFIG_DIR -Force | Out-Null
+    }
+
+    # Syncthing 不同版本的 generate 语法差异巨大：
+    #   v2.x (当前):       syncthing generate --home=DIR           （--no-default-folder 已移除）
+    #   v1.20 ~ v1.29:     syncthing generate --home=DIR --no-default-folder
+    #   v1.x 更老:         syncthing -generate=DIR
+    # 所以依次尝试；每次单独运行 + 判断 config.xml 是否出现，避免输出串扰。
+    Write-Info "首次运行 syncthing generate 以产生 config.xml..."
+    $attempts = @(
+        @{ Desc = "v2.x (generate --home=DIR)";           Args = @("generate", "--home=$LOCAL_SYNCTHING_CONFIG_DIR") },
+        @{ Desc = "v1.20+ (generate --home --no-default)"; Args = @("generate", "--home=$LOCAL_SYNCTHING_CONFIG_DIR", "--no-default-folder") },
+        @{ Desc = "legacy (-generate=DIR)";                Args = @("-generate=$LOCAL_SYNCTHING_CONFIG_DIR") }
+    )
+    $allOut = New-Object System.Text.StringBuilder
+    foreach ($a in $attempts) {
+        Write-Hint "尝试：$($a.Desc)"
+        try {
+            $out = & $LOCAL_SYNCTHING_EXE @($a.Args) 2>&1 | Out-String
+            $rc = $LASTEXITCODE
+            [void]$allOut.AppendLine("---- $($a.Desc) rc=$rc ----")
+            [void]$allOut.AppendLine($out)
+        } catch {
+            [void]$allOut.AppendLine("---- $($a.Desc) threw: $($_.Exception.Message) ----")
+        }
+        if (Test-Path $LOCAL_SYNCTHING_CONFIG_XML) {
+            Write-Ok "本地 config.xml 已生成（方式：$($a.Desc)）：$LOCAL_SYNCTHING_CONFIG_XML"
+            return
+        }
+    }
+
+    # 终极兜底：前台运行 syncthing 几秒钟让它自己初始化 config.xml 然后杀掉
+    Write-Hint "generate 子命令均未奏效，回退到前台启动 bootstrap..."
+    $bootstrapAttempts = @(
+        @{ Desc = "v2.x (serve --home --no-browser)";  Args = @("serve", "--home=$LOCAL_SYNCTHING_CONFIG_DIR", "--no-browser") },
+        @{ Desc = "v1.x (-home -no-browser)";          Args = @("-home=$LOCAL_SYNCTHING_CONFIG_DIR", "-no-browser") }
+    )
+    foreach ($b in $bootstrapAttempts) {
+        if (Test-Path $LOCAL_SYNCTHING_CONFIG_XML) { break }
+        Write-Hint "前台 bootstrap 尝试：$($b.Desc)"
+        $tmpLog = Join-Path $env:TEMP "obsidian-sync-bootstrap.log"
+        $proc = $null
+        try {
+            $proc = Start-Process -FilePath $LOCAL_SYNCTHING_EXE -ArgumentList $b.Args -WindowStyle Hidden `
+                                  -RedirectStandardOutput $tmpLog `
+                                  -RedirectStandardError  "$tmpLog.err" `
+                                  -PassThru
+        } catch {
+            [void]$allOut.AppendLine("---- bootstrap($($b.Desc)) Start-Process 失败：$($_.Exception.Message) ----")
+            continue
+        }
+        # 最多等 20 秒让它生成 config.xml
+        for ($i = 0; $i -lt 40; $i++) {
+            if (Test-Path $LOCAL_SYNCTHING_CONFIG_XML) { break }
+            if ($proc.HasExited) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        # 停掉 bootstrap 进程（我们只想要它生成 config.xml，不想让它常驻）
+        if (-not $proc.HasExited) {
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            try { Wait-Process -Id $proc.Id -Timeout 5 -ErrorAction SilentlyContinue } catch {}
+        }
+        if (Test-Path $tmpLog) {
+            [void]$allOut.AppendLine("---- bootstrap($($b.Desc)) stdout tail ----")
+            [void]$allOut.AppendLine((Get-Content $tmpLog -Tail 10 -ErrorAction SilentlyContinue) -join "`n")
+        }
+        if (Test-Path "$tmpLog.err") {
+            [void]$allOut.AppendLine("---- bootstrap($($b.Desc)) stderr tail ----")
+            [void]$allOut.AppendLine((Get-Content "$tmpLog.err" -Tail 10 -ErrorAction SilentlyContinue) -join "`n")
+        }
+        Remove-Item $tmpLog, "$tmpLog.err" -Force -ErrorAction SilentlyContinue
+        if (Test-Path $LOCAL_SYNCTHING_CONFIG_XML) {
+            Write-Ok "本地 config.xml 已生成（方式：前台 bootstrap - $($b.Desc)）：$LOCAL_SYNCTHING_CONFIG_XML"
+            return
+        }
+    }
+
+    Write-Hint "────── 所有尝试输出汇总 ──────"
+    foreach ($ln in ($allOut.ToString() -split "`n")) {
+        if ($ln.Trim()) { Write-Hint "  $($ln.TrimEnd())" }
+    }
+    Write-Hint "───────────────────────────────"
+    throw "所有 generate 方式均失败，config.xml 仍未生成。请把上方诊断信息反馈给开发者。"
+}
+
+# 强制把 GUI 改到 127.0.0.1:8384 + tls=false（方便本机 HTTP 调 API）
+function Update-LocalSyncthingConfigGui {
+    if (-not (Test-Path $LOCAL_SYNCTHING_CONFIG_XML)) {
+        throw "config.xml 不存在，无法修改 GUI 绑定"
+    }
+    try {
+        [xml]$cfg = Get-Content -Path $LOCAL_SYNCTHING_CONFIG_XML -Raw -Encoding UTF8
+    } catch {
+        throw "解析 config.xml 失败：$($_.Exception.Message)"
+    }
+    $gui = $cfg.configuration.gui
+    if (-not $gui) { throw "config.xml 中找不到 <gui> 节点" }
+    $changed = $false
+    if ($gui.address -ne "127.0.0.1:8384") { $gui.address = "127.0.0.1:8384"; $changed = $true }
+    # 强制关 TLS：Syncthing 默认自签证书，http 通信更简单
+    if ($gui.tls -ne "false") { $gui.tls = "false"; $changed = $true }
+    if ($changed) {
+        $cfg.Save($LOCAL_SYNCTHING_CONFIG_XML)
+        Write-Hint "已将本地 GUI 绑定固定为 127.0.0.1:8384（tls=false）"
+    } else {
+        Write-Hint "本地 GUI 配置已符合要求（127.0.0.1:8384, tls=false）"
+    }
+}
+
+# 检查 8384 端口是否被非 syncthing 进程占用
+function Test-LocalPort8384 {
+    try {
+        $conns = Get-NetTCPConnection -LocalPort 8384 -State Listen -ErrorAction SilentlyContinue
+    } catch { $conns = $null }
+    if (-not $conns) { return @{ Occupied = $false } }
+    $proc = $null
+    try { $proc = Get-Process -Id $conns[0].OwningProcess -ErrorAction SilentlyContinue } catch {}
+    return @{ Occupied = $true; ProcessName = $proc.ProcessName; Pid = $conns[0].OwningProcess }
+}
+
+# 启动本地 Syncthing 后台进程
+function Start-LocalSyncthingProcess {
+    # 如果 PID 文件存在且进程还活着，幂等返回
+    if (Test-Path $LOCAL_SYNCTHING_PID_FILE) {
+        $oldPid = Get-Content $LOCAL_SYNCTHING_PID_FILE -Raw -ErrorAction SilentlyContinue
+        if ($oldPid -match '^\d+$') {
+            $p = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+            if ($p -and $p.ProcessName -match 'syncthing') {
+                Write-Ok "本地 Syncthing 已在运行（PID=$oldPid），幂等跳过启动"
+                $global:LOCAL_SYNCTHING_PROCESS = $p
+                return
+            }
+        }
+    }
+
+    # 端口冲突检查
+    $portInfo = Test-LocalPort8384
+    if ($portInfo.Occupied) {
+        if ($portInfo.ProcessName -match 'syncthing') {
+            Write-Ok "已有本地 syncthing 进程占用 8384（PID=$($portInfo.Pid)），直接沿用"
+            $global:LOCAL_SYNCTHING_PROCESS = Get-Process -Id $portInfo.Pid -ErrorAction SilentlyContinue
+            Set-Content -Path $LOCAL_SYNCTHING_PID_FILE -Value "$($portInfo.Pid)" -Encoding ASCII -NoNewline
+            return
+        } else {
+            throw "本地 8384 端口已被非 syncthing 进程占用（$($portInfo.ProcessName), PID=$($portInfo.Pid)），请先释放该端口再重试"
+        }
+    }
+
+    Write-Info "启动本地 Syncthing 后台进程..."
+    # 关键参数：
+    #   serve          - 2.x 子命令，常驻运行（1.x 无此子命令，直接起主进程）
+    #   --home         - 配置目录，与 generate 一致
+    #   --no-browser   - 不自动弹出浏览器
+    #   --no-restart   - 不自 fork 重启，便于我们管理 PID
+    $args2x = @("serve", "--home=$LOCAL_SYNCTHING_CONFIG_DIR", "--no-browser", "--no-restart")
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $LOCAL_SYNCTHING_EXE -ArgumentList $args2x -WindowStyle Hidden `
+                              -RedirectStandardOutput $LOCAL_SYNCTHING_LOG `
+                              -RedirectStandardError  "$LOCAL_SYNCTHING_LOG.err" `
+                              -PassThru
+    } catch {
+        Write-Warn "2.x 风格启动失败，回退旧语法：$($_.Exception.Message)"
+    }
+
+    # 回退（1.x）: syncthing -home ... -no-browser -no-restart
+    if (-not $proc -or $proc.HasExited) {
+        $args1x = @("-home=$LOCAL_SYNCTHING_CONFIG_DIR", "-no-browser", "-no-restart")
+        $proc = Start-Process -FilePath $LOCAL_SYNCTHING_EXE -ArgumentList $args1x -WindowStyle Hidden `
+                              -RedirectStandardOutput $LOCAL_SYNCTHING_LOG `
+                              -RedirectStandardError  "$LOCAL_SYNCTHING_LOG.err" `
+                              -PassThru
+    }
+
+    if (-not $proc) { throw "无法启动本地 syncthing.exe" }
+    Start-Sleep -Milliseconds 500
+    if ($proc.HasExited) {
+        $errTail = if (Test-Path "$LOCAL_SYNCTHING_LOG.err") {
+            (Get-Content "$LOCAL_SYNCTHING_LOG.err" -Tail 20 -ErrorAction SilentlyContinue) -join "`n"
+        } else { "(无 stderr 日志)" }
+        throw "本地 syncthing 启动后立即退出 (ExitCode=$($proc.ExitCode))，stderr 片段：`n$errTail"
+    }
+
+    Set-Content -Path $LOCAL_SYNCTHING_PID_FILE -Value "$($proc.Id)" -Encoding ASCII -NoNewline
+    $global:LOCAL_SYNCTHING_PROCESS = $proc
+    Write-Ok "本地 Syncthing 已启动（PID=$($proc.Id)），日志：$LOCAL_SYNCTHING_LOG"
+}
+
+# 等待本地 API 就绪（L4 + HTTP 双阶段，与 Wait-RemoteApiReady 同构）
+function Wait-LocalApiReady {
+    Write-Info "验证本地 Syncthing API 可达..."
+
+    # L4 连通性
+    $tcpReady = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $async = $tcp.BeginConnect("127.0.0.1", 8384, $null, $null)
+            if ($async.AsyncWaitHandle.WaitOne(1000)) {
+                $tcp.EndConnect($async)
+                $tcp.Close()
+                $tcpReady = $true
+                break
+            } else {
+                $tcp.Close()
+            }
+        } catch {}
+        Start-Sleep -Milliseconds 500
+    }
+    if ($tcpReady) {
+        Write-Hint "L4 端口 127.0.0.1:8384 已监听"
+    } else {
+        Write-Warn "L4 探测未通过（127.0.0.1:8384 连不通），将继续 HTTP 轮询以获取更详细错误"
+    }
+
+    # HTTP ping 轮询（60 秒）
+    $waited = 0
+    $maxWait = 60
+    $lastErr = ""
+    while ($waited -lt $maxWait) {
+        try {
+            # 尚未读到 API Key 时先不带 key 试 /rest/noauth/health（2.x 新端点）
+            # 若仍失败，再走 /rest/system/ping（需要 API Key）
+            if ([string]::IsNullOrEmpty($global:LOCAL_API_KEY)) {
+                $r = Invoke-SyncthingApi -Method GET -Url "$LOCAL_API_URL/rest/noauth/health" -Retries 1 -TimeoutSec 3
+                $rStr = if ($r -is [string]) { $r } else { ($r | ConvertTo-Json -Compress) }
+                if ($rStr -match '"status"\s*:\s*"OK"' -or $rStr -match 'OK') {
+                    Write-Ok "本地 API 响应正常（/rest/noauth/health）"
+                    return
+                }
+                $lastErr = "health 非 OK：$rStr"
+            } else {
+                $r = Invoke-SyncthingApi -Method GET -Url "$LOCAL_API_URL/rest/system/ping" -ApiKey $global:LOCAL_API_KEY -Retries 1 -TimeoutSec 3
+                $rStr = if ($r -is [string]) { $r } else { ($r | ConvertTo-Json -Compress) }
+                if ($rStr -match "pong") {
+                    Write-Ok "本地 API 响应正常（/rest/system/ping）"
+                    return
+                }
+                $lastErr = "ping 非 pong：$rStr"
+            }
+        } catch {
+            $lastErr = $_.Exception.Message
+            if (($waited % 10) -eq 0 -and $waited -gt 0) {
+                Write-Hint "已等待 ${waited}s，最近一次错误：$lastErr"
+            }
+        }
+        Start-Sleep -Seconds 1
+        $waited++
+    }
+
+    # 失败时打印最后 30 行日志
+    Write-Warn "本地 API 在 $maxWait 秒内未能响应，最后一次错误：$lastErr"
+    if (Test-Path $LOCAL_SYNCTHING_LOG) {
+        Write-Hint "本地 Syncthing 日志末尾 30 行："
+        $tail = Get-Content $LOCAL_SYNCTHING_LOG -Tail 30 -ErrorAction SilentlyContinue
+        foreach ($ln in $tail) { if ($ln.Trim()) { Write-Hint "  $ln" } }
+    }
+    throw "本地 Syncthing API 在 $maxWait 秒内未能响应"
+}
+
+# 从本地 config.xml 解析 Device ID 与 API Key
+# 注意：此时 Syncthing API 可能还没就绪，所以不能调 REST；只能读 config.xml。
+# 风险：config.xml 的 <device> 列表会把"本机自身"与"远端对端"混在一起，
+#       新安装时第一个 <device> 就是 self，但幂等重跑（此前已经 Pair-Devices 过）
+#       会导致列表里出现多个 <device>，"第一个"未必是 self。
+# 解决：
+#   1) 这里仍然尽力从 config.xml 猜一个 Device ID（仅作为 fallback，用于
+#      Wait-LocalApiReady 之前的日志输出与 API Key 读取）。
+#   2) 在 Wait-LocalApiReady 之后调用 Confirm-LocalDeviceIdViaApi，
+#      通过 /rest/system/status 的 myID 字段拿到权威的本机 Device ID 并覆盖。
+function Read-LocalIdentity {
+    if (-not (Test-Path $LOCAL_SYNCTHING_CONFIG_XML)) {
+        throw "本地 config.xml 不存在：$LOCAL_SYNCTHING_CONFIG_XML"
+    }
+    try {
+        [xml]$cfg = Get-Content -Path $LOCAL_SYNCTHING_CONFIG_XML -Raw -Encoding UTF8
+    } catch {
+        throw "解析本地 config.xml 失败：$($_.Exception.Message)"
+    }
+    # 尝试猜 self：取 <device> 列表第一个（首次安装时 Syncthing 就是这样排的）
+    $selfDevice = $cfg.configuration.device | Select-Object -First 1
+    $deviceId = $null
+    if ($selfDevice) { $deviceId = $selfDevice.id }
+    $apiKey = $cfg.configuration.gui.apikey
+    if ([string]::IsNullOrEmpty($apiKey)) {
+        throw "无法从本地 config.xml 解析 API Key"
+    }
+    # Device ID 允许暂时为空或不准确——Confirm-LocalDeviceIdViaApi 会兜底更正
+    $global:LOCAL_DEVICE_ID = $deviceId
+    $global:LOCAL_API_KEY   = $apiKey
+}
+
+# 通过 /rest/system/status 的 myID 字段，拿到权威的本机 Device ID
+# 必须在 Wait-LocalApiReady 之后调用。
+function Confirm-LocalDeviceIdViaApi {
+    try {
+        $status = Invoke-LocalApi -Method GET -Path "/rest/system/status" -Retries 3
+    } catch {
+        # API 拿不到就退回 config.xml 的猜测值，不中断主流程
+        Write-Warn "通过 API 获取本机 Device ID 失败（$($_.Exception.Message)），沿用 config.xml 的回退值"
+        if ([string]::IsNullOrEmpty($global:LOCAL_DEVICE_ID)) {
+            throw "无法确定本机 Device ID：API 不可达且 config.xml 无可用回退"
+        }
+        return
+    }
+    $myId = $null
+    if ($status -and $status.PSObject.Properties.Name -contains 'myID') {
+        $myId = [string]$status.myID
+    }
+    if ([string]::IsNullOrEmpty($myId)) {
+        if ([string]::IsNullOrEmpty($global:LOCAL_DEVICE_ID)) {
+            throw "API 未返回 myID 字段，且 config.xml 无回退 Device ID"
+        }
+        Write-Warn "API 未返回 myID 字段，沿用 config.xml 的回退值"
+        return
+    }
+
+    if (-not [string]::IsNullOrEmpty($global:LOCAL_DEVICE_ID) `
+        -and $global:LOCAL_DEVICE_ID -ne $myId) {
+        # config.xml 的猜测值和 API 权威值不一致——这是幂等重跑场景，以 API 为准
+        Write-Hint "本机 Device ID 从 config.xml 猜测值修正为 API 权威值"
+    }
+    $global:LOCAL_DEVICE_ID = $myId
+
+    $didMasked = "$($myId.Substring(0, [Math]::Min(14, $myId.Length)))...$($myId.Substring([Math]::Max(0, $myId.Length - 7)))"
+    Write-Ok "本地 Device ID：$didMasked"
+}
+
+# 步骤 4 主入口
+function Deploy-LocalSyncthing {
+    Write-Step "步骤 4/8：本地 Windows Syncthing 安装与启动"
+
+    # 1) 幂等：已安装且版本合格直接跳过下载
+    $info = Test-LocalSyncthingInstalled
+    if ($info.Installed -and $info.Major -ge 2) {
+        Write-Ok "本地 Syncthing 已安装（版本：$($info.Version)），跳过下载步骤（幂等）"
+    } else {
+        if ($info.Installed) {
+            Write-Warn "本地已有 Syncthing $($info.Version)，但主版本 < 2，将重新下载 $LOCAL_SYNCTHING_VERSION 以保证与服务器端协议兼容"
+        } else {
+            Write-Info "本地未检测到 Syncthing，开始下载 $LOCAL_SYNCTHING_VERSION (windows-amd64)..."
+        }
+        $zip = Get-LocalSyncthingBinary
+        Expand-LocalSyncthingBinary -ZipPath $zip
+    }
+
+    # 2) 生成 config.xml（首次）
+    Initialize-LocalSyncthingConfig
+
+    # 3) 修正 GUI 绑定（127.0.0.1:8384 + tls=false）
+    Update-LocalSyncthingConfigGui
+
+    # 4) 启动后台进程
+    Start-LocalSyncthingProcess
+
+    # 5) 先从 config.xml 读 API Key（Wait-LocalApiReady 里若有 key 走 ping，否则走 /rest/noauth/health）
+    #    注意：这里读出的 Device ID 只是"回退值"，幂等重跑时 config.xml 里可能已经
+    #    混入了远端 device；权威的本机 Device ID 必须在 API 就绪之后从 /rest/system/status 拿。
+    Read-LocalIdentity
+
+    # 6) 等待 API 就绪
+    Wait-LocalApiReady
+
+    # 7) 从 /rest/system/status 的 myID 拿权威 Device ID，覆盖第 5) 步的回退值
+    Confirm-LocalDeviceIdViaApi
+
+    Write-Ok "本地 Syncthing 就绪：http://127.0.0.1:8384"
+}
+
+# ---------------------------------------------------------------------------
+# 模块：pair-devices —— 双向 Device ID 配对（步骤 5/8）
+#
+# 设计说明（与 obsidian-sync.sh 中 pair_devices() 行为完全对齐）：
+#   - 幂等：先 GET /rest/config/devices，若目标 deviceID 已存在则跳过 POST
+#   - 本地 → 服务器：addresses = ["tcp://$SSH_HOST:22000", "dynamic"]，autoAccept=false
+#   - 服务器 → 本地：addresses = ["dynamic"]，autoAccept=true（本地动态 IP，并允许自动接受文件夹）
+#   - 最后轮询 /rest/system/connections，60s 超时不阻断流程（其它服务器可能临时没上线，添 folder 时会再握手）
+# ---------------------------------------------------------------------------
+
+# 判断设备是否已在指定 scope 的 Syncthing 配置中存在
+function Test-DeviceExists {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("local", "remote")][string]$Scope,
+        [Parameter(Mandatory=$true)][string]$DeviceId
+    )
+    if ($Scope -eq "local") {
+        $devices = Invoke-LocalApi  -Method GET -Path "/rest/config/devices"
+    } else {
+        $devices = Invoke-RemoteApi -Method GET -Path "/rest/config/devices"
+    }
+    # Syncthing 返回数组，逐个匹配 deviceID
+    if (-not $devices) { return $false }
+    foreach ($d in $devices) {
+        if ($d.deviceID -eq $DeviceId) { return $true }
+    }
+    return $false
+}
+
+# 构造符合 Syncthing 2.x 模型的 device 对象（返回 JSON 字符串）
+function New-DeviceJson {
+    param(
+        [Parameter(Mandatory=$true)][string]$DeviceId,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string[]]$Addresses,
+        [bool]$AutoAcceptFolders = $false
+    )
+    # PS 5.1 和 PS 7 都支持 ConvertTo-Json；-Depth 5 避免数组被截断为 null
+    $obj = [ordered]@{
+        deviceID                 = $DeviceId
+        name                     = $Name
+        addresses                = $Addresses
+        compression              = "metadata"
+        introducer               = $false
+        skipIntroductionRemovals = $false
+        paused                   = $false
+        allowedNetworks          = @()
+        autoAcceptFolders        = $AutoAcceptFolders
+        maxSendKbps              = 0
+        maxRecvKbps              = 0
+        ignoredFolders           = @()
+        maxRequestKiB            = 0
+    }
+    return ($obj | ConvertTo-Json -Depth 5 -Compress)
+}
+
+# 向本地 Syncthing 添加服务器设备
+function Add-RemoteDeviceToLocal {
+    if (Test-DeviceExists -Scope local -DeviceId $global:REMOTE_DEVICE_ID) {
+        Write-Ok "本地已存在服务器设备（幂等跳过）"
+        return
+    }
+    Write-Info "向本地 Syncthing 添加服务器设备..."
+    $body = New-DeviceJson `
+        -DeviceId $global:REMOTE_DEVICE_ID `
+        -Name "cloud-$($global:SSH_HOST)" `
+        -Addresses @("tcp://$($global:SSH_HOST):22000", "dynamic") `
+        -AutoAcceptFolders $false
+    $null = Invoke-LocalApi -Method POST -Path "/rest/config/devices" -Body $body
+    $global:ROLLBACK_STACK += "local_device:$($global:REMOTE_DEVICE_ID)"
+    Write-Ok "服务器设备已加入本地配置"
+}
+
+# 向服务器 Syncthing 添加本地设备
+function Add-LocalDeviceToRemote {
+    if (Test-DeviceExists -Scope remote -DeviceId $global:LOCAL_DEVICE_ID) {
+        Write-Ok "服务器已存在本地设备（幂等跳过）"
+        return
+    }
+    Write-Info "向服务器 Syncthing 添加本地设备..."
+    # Windows 上用 COMPUTERNAME 作为主机名来源，对应 sh 版的 hostname -s
+    $hostShort = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { "windows-client" }
+    $body = New-DeviceJson `
+        -DeviceId $global:LOCAL_DEVICE_ID `
+        -Name "win-$hostShort" `
+        -Addresses @("dynamic") `
+        -AutoAcceptFolders $true
+    $null = Invoke-RemoteApi -Method POST -Path "/rest/config/devices" -Body $body
+    $global:ROLLBACK_STACK += "remote_device:$($global:LOCAL_DEVICE_ID)"
+    Write-Ok "本地设备已加入服务器配置"
+}
+
+# L4 测一下 $SSH_HOST:22000 是否 TCP 可达，给用户一个更明确的排障线索
+# 注意：
+#   - 这里只是一个"快速提示"，不是判决依据；真正的决断走 /rest/system/connections 轮询
+#   - 超时放宽到 5s：跨国/跨区云链路 3s 往往不够（SYN 首包 RTT + 云网关 SYN-ACK 处理偶尔会 >3s）
+#   - EndConnect 单独 try，把 "WaitOne 超时" 与 "SYN 被拒" 两种失败分清楚
+function Test-RemoteSyncPort {
+    $tcp = $null
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $async = $tcp.BeginConnect($global:SSH_HOST, 22000, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne(5000)) {
+            # 超时：SYN 没回 SYN-ACK（或回得特别慢）
+            return $false
+        }
+        try {
+            $tcp.EndConnect($async)
+            return $true
+        } catch {
+            # 对方 RST / 不可达主机
+            return $false
+        }
+    } catch {
+        return $false
+    } finally {
+        if ($tcp) { try { $tcp.Close() } catch {} }
+    }
+}
+
+# 轮询 /rest/system/connections，等待双向 TCP 握手建立
+function Wait-PeerConnected {
+    # 允许通过环境变量 OBSIDIAN_SYNC_PEER_WAIT 覆盖默认 60s（与 sh 版对齐）
+    $waitTimeout = 60
+    if ($env:OBSIDIAN_SYNC_PEER_WAIT -match '^\d+$') {
+        $waitTimeout = [int]$env:OBSIDIAN_SYNC_PEER_WAIT
+    }
+    Write-Info "等待双向 TCP 连接建立（最长 ${waitTimeout}s，可用 OBSIDIAN_SYNC_PEER_WAIT 覆盖）..."
+
+    # 端口快速探测（L4 SYN 握手；只是一个"提前提示"，不是判决依据）
+    $portProbe = Test-RemoteSyncPort
+    if ($portProbe) {
+        Write-Ok "端口探测：$($global:SSH_HOST):22000 TCP 可达"
+    } else {
+        Write-Hint "端口探测：$($global:SSH_HOST):22000 首次 SYN 未在 5s 内握手成功（可能云网关首包处理慢或安全组未放通）"
+        Write-Hint "  → 若下方最终提示"双向连接已建立"，说明端口实际是通的，可忽略本条提示"
+        Write-Hint "  → 若一直未建立，请放通云厂商安全组：22000/tcp 与 22000/udp（可选 21027/udp 用于 LAN 发现）"
+    }
+
+    $waited = 0
+    $connected = $false
+    while ($waited -lt $waitTimeout) {
+        try {
+            $status = Invoke-LocalApi -Method GET -Path "/rest/system/connections" -Retries 1
+            # 模型：{ total: {...}, connections: { "<deviceID>": { connected: bool, ... } } }
+            if ($status -and $status.connections) {
+                # PSObject 下用 PSObject.Properties 或动态属性访问
+                $peer = $status.connections.PSObject.Properties[$global:REMOTE_DEVICE_ID]
+                if ($peer -and $peer.Value -and $peer.Value.connected -eq $true) {
+                    Write-Host ""
+                    Write-Ok "双向连接已建立（connected=true）"
+                    $connected = $true
+                    break
+                }
+            }
+        } catch {
+            # 单次失败静默重试
+        }
+        Start-Sleep -Seconds 2
+        $waited += 2
+        Write-Host "." -NoNewline
+    }
+
+    if (-not $connected) {
+        Write-Host ""
+        Write-Err "${waitTimeout} 秒内未检测到 connected=true"
+        Write-Err "排障建议："
+        Write-Err "  1. 云厂商安全组是否放通 22000/tcp、8384(可选)、22000/udp"
+        Write-Err "  2. 服务器本机防火墙是否放通（ufw/firewalld）"
+        Write-Err "  3. Windows 上确认 $($global:SSH_HOST):22000 可达：Test-NetConnection $($global:SSH_HOST) -Port 22000"
+        
+        # 如果端口探测失败且最终连接失败，抛出错误停止执行
+        if (-not $portProbe) {
+            throw "同步连接失败：端口 $($global:SSH_HOST):22000 不可达，请检查安全组设置"
+        } else {
+            Write-Warn "将继续执行后续步骤（创建 folder 会主动触发握手，通常能加速连接建立）"
+        }
+    }
+}
+
+# 步骤 5 主入口
+function Pair-Devices {
+    Write-Step "步骤 5/8：双向 Device ID 配对"
+    Add-RemoteDeviceToLocal
+    Add-LocalDeviceToRemote
+    Wait-PeerConnected
+}
+
+# ---------------------------------------------------------------------------
+# 模块：select-vaults —— Obsidian Vault 发现与多选（步骤 6/8）
+#
+# 与 obsidian-sync.sh select_obsidian_vaults() 行为对齐：
+#   1. 确定 Vault 根目录：默认 $DEFAULT_OBSIDIAN_ROOT，不存在则让用户输入自定义路径
+#   2. 列出一级子目录作为候选（忽略隐藏目录），标注大小、是否含 OneDrive/云提供商占位符
+#   3. 优先用 fzf（若已安装）；否则降级为数字菜单多选（空格/逗号/'a' 全选）
+#   4. 结果写入 $global:SELECTED_VAULTS
+# ---------------------------------------------------------------------------
+
+# 探测目录下是否存在云盘未下载占位符。对应 sh 版 .icloud 检测，在 Windows 上识别 OneDrive 的按需文件：
+#   - FILE_ATTRIBUTE_OFFLINE (0x1000)
+#   - FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS (0x400000)
+# 扩展名为 .icloud 的文件也算（Mac 跨端拷贝了 iCloud 占位符的情况）。
+function Test-DirHasCloudPlaceholder {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        # 限制深度：最多递归 5 层，避免 Vault 巨大时卡死
+        $items = Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue `
+                    -Depth 5 | Select-Object -First 2000
+    } catch { return $false }
+    $offlineMask = 0x401000   # OFFLINE | RECALL_ON_DATA_ACCESS
+    foreach ($f in $items) {
+        if ($f.Name -like "*.icloud") { return $true }
+        if ($f.Attributes -band $offlineMask) { return $true }
+    }
+    return $false
+}
+
+# 确定 Vault 根目录：默认使用 $DEFAULT_OBSIDIAN_ROOT，不存在则让用户手输
+function Resolve-ObsidianRoot {
+    if (Test-Path -LiteralPath $DEFAULT_OBSIDIAN_ROOT -PathType Container) {
+        return $DEFAULT_OBSIDIAN_ROOT
+    }
+    Write-Warn "未检测到默认 Obsidian 目录："
+    Write-Warn "  $DEFAULT_OBSIDIAN_ROOT"
+    # 提供两个常见备选：OneDrive 或普通 Documents
+    $oneDriveGuess = Join-Path $env:USERPROFILE "OneDrive\Documents\Obsidian"
+    $docGuess      = Join-Path $env:USERPROFILE "Documents"
+    $fallback = if (Test-Path -LiteralPath $oneDriveGuess -PathType Container) { $oneDriveGuess } else { $docGuess }
+
+    $custom = Read-WithDefault -Prompt "请手动输入 Obsidian 根目录（包含多个 Vault 的父目录）" -DefaultValue $fallback
+    if (-not (Test-Path -LiteralPath $custom -PathType Container)) {
+        throw "目录不存在：$custom"
+    }
+    return $custom
+}
+
+# 列出候选 Vault（root 下的一级子目录），返回对象数组：
+#   @{ Path = ...; SizeText = "12.3 MB" / "计算中"; HasPlaceholder = $true/$false; IsVault = $true/$false }
+# IsVault: 目录内包含 .obsidian 则认为是真的 Obsidian Vault
+function Get-VaultCandidates {
+    param([Parameter(Mandatory=$true)][string]$Root)
+    $dirs = Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue `
+                | Where-Object { -not $_.Name.StartsWith(".") }
+    $results = @()
+    foreach ($d in $dirs) {
+        # 大小计算用 Measure-Object + -ErrorAction SilentlyContinue，给巨大目录加上限（则显示 "> 5 GB"）
+        $sizeText = "-"
+        try {
+            $tot = 0
+            $fileCount = 0
+            foreach ($f in Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Force -ErrorAction SilentlyContinue) {
+                $tot += $f.Length
+                $fileCount++
+                if ($tot -gt 5GB -or $fileCount -gt 20000) { break }
+            }
+            if     ($tot -gt 5GB) { $sizeText = "> 5.00 GB" }
+            elseif ($tot -gt 1GB) { $sizeText = "{0:N2} GB" -f ($tot / 1GB) }
+            elseif ($tot -gt 1MB) { $sizeText = "{0:N2} MB" -f ($tot / 1MB) }
+            elseif ($tot -gt 1KB) { $sizeText = "{0:N1} KB" -f ($tot / 1KB) }
+            else                   { $sizeText = "$tot B" }
+        } catch {}
+
+        $isVault = Test-Path -LiteralPath (Join-Path $d.FullName ".obsidian") -PathType Container
+        $hasPlaceholder = Test-DirHasCloudPlaceholder -Path $d.FullName
+
+        $results += [pscustomobject]@{
+            Path           = $d.FullName
+            Name           = $d.Name
+            SizeText       = $sizeText
+            IsVault        = $isVault
+            HasPlaceholder = $hasPlaceholder
+        }
+    }
+    # Vault 置顶，同类按名字排序，方便用户较快定位
+    return ($results | Sort-Object -Property @{Expression="IsVault";Descending=$true}, @{Expression="Name";Descending=$false})
+}
+
+# 格式化单行展示（用于 fzf 输入、数字菜单）
+function Format-VaultCandidateLine {
+    param(
+        [Parameter(Mandatory=$true)][int]$Index,
+        [Parameter(Mandatory=$true)]$Candidate,
+        [switch]$WithIndex
+    )
+    $tag = ""
+    if ($Candidate.IsVault) { $tag += " [✓ Vault]" }
+    if ($Candidate.HasPlaceholder) { $tag += " [⚠ 含云未下载占位]" }
+    $namePart = $Candidate.Name
+    if ($namePart.Length -gt 50) { $namePart = $namePart.Substring(0, 47) + "..." }
+    if ($WithIndex) {
+        return ("{0,2}. {1,-50}  {2,10}{3}" -f $Index, $namePart, $Candidate.SizeText, $tag)
+    } else {
+        return ("{0,-50}  {1,10}{2}" -f $namePart, $Candidate.SizeText, $tag)
+    }
+}
+
+# 执行多选：fzf 可用则走 fzf，否则数字菜单
+function Select-VaultsInteractive {
+    param([Parameter(Mandatory=$true)][object[]]$Candidates)
+    if ($Candidates.Count -eq 0) {
+        throw "未发现任何 Vault 目录"
+    }
+
+    # 只有 1 个候选时，跳过 fzf/数字菜单这类多选 UI，直接询问 Y/n（更符合直觉，避免误操作）
+    if ($Candidates.Count -eq 1) {
+        $only = $Candidates[0]
+        $line = Format-VaultCandidateLine -Index 1 -Candidate $only
+        Write-Host ""
+        Write-Host ("  仅发现 1 个候选 Vault：{0}" -f $line) -ForegroundColor White
+        Write-Host ""
+        if (Confirm "是否同步该 Vault？" "Y") {
+            return @($only.Path)
+        } else {
+            throw "已取消：未选择任何 Vault"
+        }
+    }
+
+    $hasFzf = [bool](Get-Command fzf -ErrorAction SilentlyContinue)
+    if ($hasFzf) {
+        Write-Info ("共 {0} 个候选目录：请按 TAB 选中（可多选），再按 ENTER 确认（ESC 取消）" -f $Candidates.Count)
+        Write-Hint "提示：输入关键字可快速过滤；输入完后 Ctrl+A 可全选当前过滤结果"
+        # 格式：<index>|<display>，只展示 display，回获用 index
+        $lines = for ($i = 0; $i -lt $Candidates.Count; $i++) {
+            "{0}|{1}" -f ($i + 1), (Format-VaultCandidateLine -Index ($i+1) -Candidate $Candidates[$i])
+        }
+        $tmpIn  = Join-Path $env:TEMP "obsidian-sync-fzf-in.txt"
+        $tmpOut = Join-Path $env:TEMP "obsidian-sync-fzf-out.txt"
+        $lines -join "`n" | Set-Content -LiteralPath $tmpIn -Encoding UTF8
+        # 用 cmd 重定向执行 fzf，避免 PowerShell Pipeline 在 TUI 模式下的奇怪问题
+        & cmd /c "type `"$tmpIn`" | fzf --multi --height=60%% --layout=reverse --border --header=`"TAB=选中  ENTER=确认  ESC=取消  Ctrl+A=全选`" --prompt=`"> `" --delimiter=`"|`" --with-nth=2 --bind=`"ctrl-a:select-all`" > `"$tmpOut`" 2>NUL" | Out-Null
+        $selectedLines = @()
+        if (Test-Path $tmpOut) {
+            $selectedLines = @(Get-Content -LiteralPath $tmpOut -Encoding UTF8 | Where-Object { $_ -and $_.Trim() })
+            Remove-Item $tmpOut -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item $tmpIn -Force -ErrorAction SilentlyContinue
+        if ($selectedLines.Count -eq 0) {
+            Write-Hint "⚠ fzf 中未选中任何项：请用 TAB（而非直接 ENTER）选中条目后再确认；或输入关键字过滤后按 Ctrl+A 全选"
+            throw "未选择任何 Vault"
+        }
+        $picked = @()
+        foreach ($ln in $selectedLines) {
+            $idx = [int]($ln.Split('|')[0])
+            if ($idx -ge 1 -and $idx -le $Candidates.Count) {
+                $picked += $Candidates[$idx - 1].Path
+            }
+        }
+        return $picked
+    }
+
+    # 降级：数字菜单
+    Write-Info "fzf 未安装，使用数字菜单多选"
+    Write-Host ""
+    for ($i = 0; $i -lt $Candidates.Count; $i++) {
+        $line = Format-VaultCandidateLine -Index ($i+1) -Candidate $Candidates[$i] -WithIndex
+        Write-Host ("  " + $line)
+    }
+    Write-Host ""
+    Write-Info "输入方式：多个编号用空格或逗号分隔，例如：1 3 5；输入 a 全选；直接回车将取消"
+    $input = Read-WithDefault -Prompt "请选择要同步的 Vault" -DefaultValue ""
+    if ([string]::IsNullOrWhiteSpace($input)) {
+        throw "未选择任何 Vault"
+    }
+    $pickedIdx = @{}
+    if ($input.Trim() -ieq "a") {
+        for ($k = 1; $k -le $Candidates.Count; $k++) { $pickedIdx[$k] = $true }
+    } else {
+        foreach ($token in ($input -split '[\s,]+')) {
+            if ($token -match '^\d+$') {
+                $n = [int]$token
+                if ($n -ge 1 -and $n -le $Candidates.Count) { $pickedIdx[$n] = $true }
+                else { Write-Warn "忽略无效输入：$token" }
+            } elseif ($token) {
+                Write-Warn "忽略无效输入：$token"
+            }
+        }
+    }
+    $picked = @()
+    foreach ($k in $pickedIdx.Keys) { $picked += $Candidates[$k - 1].Path }
+    if ($picked.Count -eq 0) { throw "未选择任何 Vault" }
+    return $picked
+}
+
+# 步骤 6 主入口
+function Select-ObsidianVaults {
+    Write-Step "步骤 6/8：选择要同步的 Obsidian Vault"
+    $root = Resolve-ObsidianRoot
+    Write-Info "扫描目录：$root"
+
+    $candidates = Get-VaultCandidates -Root $root
+    if (-not $candidates -or $candidates.Count -eq 0) {
+        throw "$root 下未发现任何子目录（请确认此目录包含你的 Obsidian Vault）"
+    }
+    # PowerShell 单元素时 Sort-Object 返回标量而非数组，强制包装
+    $candidates = @($candidates)
+    Write-Hint ("共发现 {0} 个候选目录（{1} 个含 .obsidian 标记）" -f `
+        $candidates.Count, (($candidates | Where-Object { $_.IsVault }).Count))
+
+    $picked = Select-VaultsInteractive -Candidates $candidates
+    $picked = @($picked)
+    $global:SELECTED_VAULTS = $picked
+
+    # 构建文件夹配置映射，用于后续复用文件夹ID
+    $global:SAVED_FOLDER_MAP = @{}
+    if ($global:SAVED_FOLDERS -and $global:SAVED_FOLDERS.Count -gt 0) {
+        foreach ($savedFolder in $global:SAVED_FOLDERS) {
+            if ($savedFolder.localPath) {
+                $global:SAVED_FOLDER_MAP[$savedFolder.localPath] = $savedFolder.folderID
+            }
+        }
+        Write-Info ("已加载 {0} 个已保存的文件夹配置" -f $global:SAVED_FOLDER_MAP.Count)
+    }
+
+    Write-Host ""
+    Write-Info ("已选择 {0} 个 Vault：" -f $picked.Count)
+    foreach ($p in $picked) {
+        $warn = ""
+        if (Test-DirHasCloudPlaceholder -Path $p) {
+            $warn = "  [⚠ 含云未下载占位，建议先手动下载再同步！]"
+        }
+        
+        # 显示是否复用已保存的文件夹ID
+        $folderIdInfo = ""
+        if ($global:SAVED_FOLDER_MAP.ContainsKey($p)) {
+            $folderIdInfo = " [复用文件夹ID: $($global:SAVED_FOLDER_MAP[$p])]"
+        }
+        
+        Write-Host ("  • {0}{1}{2}" -f $p, $warn, $folderIdInfo) -ForegroundColor White
+    }
+    Write-Host ""
+}
+
+# ---------------------------------------------------------------------------
+# 模块：share-folders —— 创建双向共享文件夹（步骤 7/8）
+#
+# 与 obsidian-sync.sh create_shared_folders()/...share_one_vault() 行为对齐：
+#   1. folderID 规范：清洗非法字符 + 5 位随机后缀，防冲突
+#   2. 本地幂等：相同 path 已存在则复用原 folder id，不重建
+#   3. 服务器先建目录并赋权，再 POST folder（/data/obsidian/<目录名>）
+#   4. 轮询 /rest/db/status?folder=ID 等待首次扫描 idle（最长 300s，超时仅 warn）
+#   5. Windows 特制：用 中英文/空格 的 Vault 名做 label，但 remote 目录名转为 ASCII 友好
+# ---------------------------------------------------------------------------
+
+# 将任意 Vault 名清洗为 folder id：
+#   - 空格 → `-`
+#   - 仅保留 A-Za-z0-9_-（漫字/中文/等完全剔除）
+#   - 前缀最长 32
+#   - 后缀：5 位小写随机（防擞同名冲突）
+# 输入纯中文时兼骤 fallback="vault"
+function ConvertTo-FolderId {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    $clean = ($Name -replace '\s+', '-')
+    $clean = ($clean -replace '[^A-Za-z0-9_-]', '')
+    if ([string]::IsNullOrEmpty($clean)) { $clean = "vault" }
+    if ($clean.Length -gt 32) { $clean = $clean.Substring(0, 32) }
+    $suffix = (New-RandomString -Length 5).ToLower()
+    return "{0}-{1}" -f $clean, $suffix
+}
+
+# Vault 名转为远端目录名：同 ConvertTo-FolderId 但不加随机后缀（目录名需要稳定、可读）
+# 保留 _ 与 -，替换其他所有非 ASCII 位置；全空时 fallback 为 “vault-<随机>”
+function ConvertTo-RemoteSafeName {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    $clean = ($Name -replace '\s+', '-')
+    $clean = ($clean -replace '[^A-Za-z0-9_-]', '')
+    if ([string]::IsNullOrEmpty($clean)) {
+        $clean = "vault-" + (New-RandomString -Length 5).ToLower()
+    }
+    if ($clean.Length -gt 48) { $clean = $clean.Substring(0, 48) }
+    return $clean
+}
+
+# 判断 folder 是否已在指定 Syncthing（local/remote）配置中存在
+function Test-FolderExists {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("local","remote")][string]$Scope,
+        [Parameter(Mandatory=$true)][string]$FolderId
+    )
+    if ($Scope -eq "local") {
+        $folders = Invoke-LocalApi  -Method GET -Path "/rest/config/folders"
+    } else {
+        $folders = Invoke-RemoteApi -Method GET -Path "/rest/config/folders"
+    }
+    if (-not $folders) { return $false }
+    foreach ($f in $folders) {
+        if ($f.id -eq $FolderId) { return $true }
+    }
+    return $false
+}
+
+# 本地幂等复用：根据 path 找已存在的 folder id（存在则返回，否则 $null）
+function Find-LocalFolderIdByPath {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $folders = Invoke-LocalApi -Method GET -Path "/rest/config/folders"
+    if (-not $folders) { return $null }
+    
+    # 规范化输入路径（统一大小写和路径分隔符）
+    $normalizedPath = ($Path -replace '\\', '/').TrimEnd('/').ToLower()
+    
+    foreach ($f in $folders) {
+        if (-not $f.path) { continue }
+        
+        # 规范化存储路径（统一大小写和路径分隔符）
+        $normalizedStoredPath = ($f.path -replace '\\', '/').TrimEnd('/').ToLower()
+        
+        # 精确匹配规范化后的路径
+        if ($normalizedStoredPath -eq $normalizedPath) {
+            return $f.id
+        }
+    }
+    return $null
+}
+
+# 构造 folder JSON（sendreceive + staggered 版本控制）
+#   -PeerDeviceIds：对端 device ID 数组（不包含自己）
+#     • 本地端：SELECTED_REMOTE_DEVICES（可多台）
+#     • 服务器端：仅 $LOCAL_DEVICE_ID 一台
+function New-FolderJson {
+    param(
+        [Parameter(Mandatory=$true)][string]$FolderId,
+        [Parameter(Mandatory=$true)][string]$Label,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string[]]$PeerDeviceIds
+    )
+    # devices = 自己 + 对端（去重、去空、去掘自己）
+    $devices = @( [ordered]@{ deviceID = $global:LOCAL_DEVICE_ID } )
+    $seen = @{ ($global:LOCAL_DEVICE_ID) = $true }
+    foreach ($d in $PeerDeviceIds) {
+        if ([string]::IsNullOrWhiteSpace($d)) { continue }
+        if ($seen.ContainsKey($d)) { continue }
+        $seen[$d] = $true
+        $devices += [ordered]@{ deviceID = $d }
+    }
+
+    $obj = [ordered]@{
+        id                     = $FolderId
+        label                  = $Label
+        path                   = $Path
+        type                   = "sendreceive"
+        rescanIntervalS        = 60
+        fsWatcherEnabled       = $true
+        fsWatcherDelayS        = 10
+        ignorePerms            = $false
+        autoNormalize          = $true
+        devices                = $devices
+        versioning             = [ordered]@{
+            type   = "staggered"
+            params = [ordered]@{
+                cleanInterval = "3600"
+                maxAge        = "2592000"
+                versionsPath  = ""
+            }
+        }
+        copiers                = 0
+        puller                 = 0
+        hashers                = 0
+        order                  = "random"
+        ignoreDelete           = $false
+        scanProgressIntervalS  = 0
+        pullerPauseS           = 0
+        maxConflicts           = 10
+        disableSparseFiles     = $false
+        disableTempIndexes     = $false
+        paused                 = $false
+        weakHashThresholdPct   = 25
+        markerName             = ".stfolder"
+        copyOwnershipFromParent = $false
+        modTimeWindowS         = 0
+    }
+    return ($obj | ConvertTo-Json -Depth 10 -Compress)
+}
+
+# ---------------------------------------------------------------------------
+# 幂等自愈：校验并补齐 folder.devices 数组
+#
+# 背景（对应 obsidian-sync.sh 历史没踩的坑）：
+#   - 首次部署时，若本地 config.xml 里只有远端一条 <device>（因为远端 ID 被提前写入），
+#     Confirm-LocalDeviceIdViaApi 之前的旧流程可能把 $LOCAL_DEVICE_ID 猜成了远端 ID
+#   - 用错的 LOCAL_DEVICE_ID 创建远端 folder 后，远端 folder.devices 里就没有
+#     真正的本地 device；之后再跑脚本走"幂等跳过"，folder 共享永远修不回来
+#   - 症状：device 连接成功（connected=true）、本地 idle、但远端文件夹一直空
+#
+# 本函数职责：
+#   1) 拉取目标端指定 folder 的当前配置
+#   2) 如果 devices 数组里缺了 $RequiredDeviceId，就补进去并 PUT 回去
+#   3) 已存在则沉默返回 $false（表示"无需改动"）
+# ---------------------------------------------------------------------------
+function Update-FolderDevicesIfMissing {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("local","remote")][string]$Scope,
+        [Parameter(Mandatory=$true)][string]$FolderId,
+        [Parameter(Mandatory=$true)][string]$RequiredDeviceId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RequiredDeviceId)) {
+        Write-Warn "Update-FolderDevicesIfMissing: RequiredDeviceId 为空，跳过"
+        return $false
+    }
+
+    $apiPath = "/rest/config/folders/$FolderId"
+    try {
+        if ($Scope -eq "local") {
+            $folder = Invoke-LocalApi  -Method GET -Path $apiPath -Retries 2
+        } else {
+            $folder = Invoke-RemoteApi -Method GET -Path $apiPath -Retries 2
+        }
+    } catch {
+        Write-Warn ("读取 {0} folder [{1}] 配置失败：{2}" -f $Scope, $FolderId, $_.Exception.Message)
+        return $false
+    }
+
+    if (-not $folder) {
+        Write-Warn ("{0} folder [{1}] 不存在，无法补齐 devices" -f $Scope, $FolderId)
+        return $false
+    }
+
+    # 已经包含就返回 false
+    $hasRequired = $false
+    if ($folder.devices) {
+        foreach ($d in $folder.devices) {
+            if ($d.deviceID -and ($d.deviceID -eq $RequiredDeviceId)) { $hasRequired = $true; break }
+        }
+    }
+
+    if ($hasRequired) { return $false }
+
+    $maskedDid = if ($RequiredDeviceId.Length -ge 7) { $RequiredDeviceId.Substring(0,7) } else { $RequiredDeviceId }
+    Write-Warn ("检测到 {0} folder [{1}] 的 devices 列表缺少 {2}...，正在补齐" -f $Scope, $FolderId, $maskedDid)
+
+    # 把 PSCustomObject 的 devices 数组转成普通 hashtable 数组后追加
+    $newDevices = @()
+    if ($folder.devices) {
+        foreach ($d in $folder.devices) {
+            $entry = [ordered]@{ deviceID = [string]$d.deviceID }
+            # 保留 Syncthing 可能带的 introducedBy / encryptionPassword 字段
+            foreach ($propName in @('introducedBy','encryptionPassword')) {
+                if ($d.PSObject.Properties.Name -contains $propName) {
+                    $entry[$propName] = $d.$propName
+                }
+            }
+            $newDevices += $entry
+        }
+    }
+    $newDevices += [ordered]@{ deviceID = $RequiredDeviceId }
+
+    # 只 PATCH devices 字段，避免把其他未知字段改坏
+    # Syncthing v2 的 PATCH /rest/config/folders/{id} 接受部分 JSON
+    $patchBody = @{ devices = $newDevices } | ConvertTo-Json -Depth 6 -Compress
+
+    try {
+        if ($Scope -eq "local") {
+            $null = Invoke-LocalApi  -Method PATCH -Path $apiPath -Body $patchBody -Retries 2
+        } else {
+            $null = Invoke-RemoteApi -Method PATCH -Path $apiPath -Body $patchBody -Retries 2
+        }
+        Write-Ok ("{0} folder [{1}] 的 devices 已补齐（新增 {2}）" -f $Scope, $FolderId, $maskedDid)
+        return $true
+    } catch {
+        Write-Warn ("PATCH 失败，改为 PUT 整体替换：{0}" -f $_.Exception.Message)
+        # 回退方案：PUT 整条 folder（某些老版本不支持 PATCH 子字段）
+        # 修改后的 folder 对象（把 devices 换成新的）
+        $folder | Add-Member -NotePropertyName devices -NotePropertyValue $newDevices -Force
+        $putBody = $folder | ConvertTo-Json -Depth 10 -Compress
+        try {
+            if ($Scope -eq "local") {
+                $null = Invoke-LocalApi  -Method PUT -Path $apiPath -Body $putBody -Retries 2
+            } else {
+                $null = Invoke-RemoteApi -Method PUT -Path $apiPath -Body $putBody -Retries 2
+            }
+            Write-Ok ("{0} folder [{1}] 的 devices 已通过 PUT 补齐" -f $Scope, $FolderId)
+            return $true
+        } catch {
+            Write-Warn ("补齐 devices 失败（{0}），请到 Syncthing GUI 手动把 device {1} 添加到该 folder 的共享列表" -f $_.Exception.Message, $maskedDid)
+            return $false
+        }
+    }
+}
+
+# 在服务器上预创建目录并赋权给 Syncthing 运行用户
+# 使用单引号 here-string + __PLACEHOLDER__ 占位替换的写法，避免
+# PowerShell 双引号字符串里嵌套 `$` / `"` 的转义陷阱
+function Invoke-RemotePrepareFolderDir {
+    param([Parameter(Mandatory=$true)][string]$RemotePath)
+    $tmpl = @'
+set -e
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+$sudo_cmd mkdir -p "__REMOTE_PATH__"
+$sudo_cmd chown -R "__RUN_USER__":"__RUN_USER__" "__REMOTE_PATH__"
+echo OK
+'@
+    $script = $tmpl.Replace("__REMOTE_PATH__", $RemotePath)
+    $script = $script.Replace("__RUN_USER__",  $global:REMOTE_RUN_USER)
+    $r = Invoke-SSHScript -Script $script -ThrowOnError
+    if ($r.Output -notmatch 'OK') {
+        throw "创建远端目录失败：$RemotePath`n$($r.Output)"
+    }
+}
+
+function Wait-FolderScan {
+    param(
+        [Parameter(Mandatory=$true)][string]$FolderId,
+        [int]$MaxWaitSec = 300
+    )
+    Write-Info "等待文件夹 [$FolderId] 完成首次扫描..."
+    $waited = 0
+    $done = $false
+    while ($waited -lt $MaxWaitSec) {
+        try {
+            $status = Invoke-LocalApi -Method GET -Path "/rest/db/status?folder=$FolderId" -Retries 1
+            $state = if ($status -and $status.state) { $status.state } else { "unknown" }
+            switch ($state) {
+                "idle" {
+                    # 检查同步统计信息，确保文件实际同步
+                    $syncStats = Invoke-LocalApi -Method GET -Path "/rest/db/status?folder=$FolderId" -Retries 1
+                    if ($syncStats -and $syncStats.globalBytes -and $syncStats.globalBytes -gt 0) {
+                        Write-Host ""
+                        Write-Ok "[$FolderId] 扫描完成（idle），已同步 $($syncStats.globalBytes) 字节"
+                        $done = $true
+                    } else {
+                        # 状态为idle但没有同步数据，可能是空文件夹或同步问题
+                        Write-Host ""
+                        Write-Warn "[$FolderId] 状态为idle但未检测到同步数据，继续等待..."
+                        Start-Sleep -Seconds 5
+                        $waited += 5
+                        continue
+                    }
+                    break
+                }
+                "scanning" { Write-Host "." -NoNewline }
+                "syncing"  { Write-Host "." -NoNewline }
+                default    { Write-Host "?" -NoNewline }
+            }
+            if ($done) { break }
+        } catch {
+            # API 偶发失败静默重试
+        }
+        Start-Sleep -Seconds 2
+        $waited += 2
+    }
+    if (-not $done) {
+        Write-Host ""
+        Write-Warn "[$FolderId] 首次扫描在 ${MaxWaitSec}s 内未结束（大 Vault 的正常行为，将后台继续）"
+    }
+}
+
+# 验证文件同步状态
+function Verify-SyncStatus {
+    param(
+        [Parameter(Mandatory=$true)][string]$FolderId,
+        [Parameter(Mandatory=$true)][string]$LocalPath
+    )
+
+    Write-Info "验证文件夹 [$FolderId] 同步状态..."
+
+    # 1. 检查本地文件夹状态
+    if (-not (Test-Path $LocalPath)) {
+        Write-Warn "本地文件夹路径不存在: $LocalPath"
+        return $false
+    }
+
+    $localFiles = Get-ChildItem -Path $LocalPath -Recurse -File | Measure-Object
+    Write-Info "本地文件夹包含 $($localFiles.Count) 个文件"
+
+    if ($localFiles.Count -eq 0) {
+        Write-Warn "本地文件夹为空，无需同步"
+        return $true
+    }
+
+    # 2. 检查连接状态
+    try {
+        $connections = Invoke-LocalApi -Method GET -Path "/rest/system/connections" -Retries 2
+        if (-not $connections -or -not $connections.connections) {
+            Write-Warn "无法获取设备连接状态"
+            return $false
+        }
+
+        $remoteConnected = $false
+        foreach ($conn in $connections.connections.PSObject.Properties) {
+            if ($conn.Name -eq $global:REMOTE_DEVICE_ID -and $conn.Value.connected -eq $true) {
+                $remoteConnected = $true
+                Write-Ok "远程设备连接正常"
+                break
+            }
+        }
+
+        if (-not $remoteConnected) {
+            Write-Warn "远程设备未连接，请检查网络和端口设置"
+            return $false
+        }
+    } catch {
+        Write-Warn "连接状态检查失败：$($_.Exception.Message)"
+        return $false
+    }
+
+    # 3. 检查同步统计信息
+    try {
+        $syncStats = Invoke-LocalApi -Method GET -Path "/rest/db/status?folder=$FolderId" -Retries 3
+        if (-not $syncStats) {
+            Write-Warn "无法获取同步统计信息"
+            return $false
+        }
+
+        Write-Info "同步状态诊断："
+        Write-Info "  - 状态: $($syncStats.state)"
+        Write-Info "  - 本地字节: $($syncStats.localBytes)"
+        Write-Info "  - 全局字节: $($syncStats.globalBytes)"
+        Write-Info "  - 需要字节: $($syncStats.needBytes)"
+    } catch {
+        Write-Warn "同步状态检查失败：$($_.Exception.Message)"
+        return $false
+    }
+
+    # 4. 本地和远端 folder 的 devices 列表交叉验证（这是同步是否真正建立的关键）
+    try {
+        $localFolder  = Invoke-LocalApi  -Method GET -Path "/rest/config/folders/$FolderId" -Retries 2
+        $remoteFolder = Invoke-RemoteApi -Method GET -Path "/rest/config/folders/$FolderId" -Retries 2
+
+        $localDevices  = @(); if ($localFolder  -and $localFolder.devices)  { $localDevices  = @($localFolder.devices  | ForEach-Object { [string]$_.deviceID }) }
+        $remoteDevices = @(); if ($remoteFolder -and $remoteFolder.devices) { $remoteDevices = @($remoteFolder.devices | ForEach-Object { [string]$_.deviceID }) }
+
+        Write-Info ("  - 本地 folder.devices: {0} 条"  -f $localDevices.Count)
+        Write-Info ("  - 远端 folder.devices: {0} 条"  -f $remoteDevices.Count)
+
+        $localHasRemote  = $localDevices  -contains $global:REMOTE_DEVICE_ID
+        $remoteHasLocal  = $remoteDevices -contains $global:LOCAL_DEVICE_ID
+
+        if (-not $localHasRemote) {
+            Write-Warn "本地 folder 未把服务器 Device 列为 peer（缺 $($global:REMOTE_DEVICE_ID.Substring(0,7))...），同步不会发生"
+            return $false
+        }
+        if (-not $remoteHasLocal) {
+            Write-Warn "远端 folder 未把本地 Device 列为 peer（缺 $($global:LOCAL_DEVICE_ID.Substring(0,7))...），同步不会发生"
+            return $false
+        }
+
+        Write-Ok "双向 folder.devices 互相包含，共享关系已建立"
+    } catch {
+        Write-Warn "folder.devices 交叉校验失败：$($_.Exception.Message)"
+    }
+
+    # 5. 综合判断：用 completion API 看"远端对这个 folder 的完成度"
+    #    这是判断"服务器端是否真的收到了文件"的唯一权威判据。
+    #    /rest/db/completion?folder=X&device=Y 返回 { completion: 0~100, needBytes, needItems, ... }
+    #    其中 device 要填"对端"的 ID（从本地视角就是 REMOTE_DEVICE_ID），
+    #    结果表示"对端相对 folder 的全局状态还差多少"。completion=100 且 needBytes=0 才算同步到位。
+    try {
+        $completion = Invoke-LocalApi -Method GET `
+            -Path "/rest/db/completion?folder=$FolderId&device=$($global:REMOTE_DEVICE_ID)" -Retries 2
+        if ($completion) {
+            Write-Info "远端完成度："
+            Write-Info ("  - completion: {0}%" -f $completion.completion)
+            Write-Info ("  - needBytes : {0}" -f $completion.needBytes)
+            Write-Info ("  - needItems : {0}" -f $completion.needItems)
+            if ($completion.completion -ge 100 -and -not $completion.needBytes) {
+                Write-Ok "远端已同步到 100%（文件已到达服务器）"
+                return $true
+            } else {
+                Write-Warn ("远端尚未完成同步：completion={0}% needBytes={1} needItems={2}" -f `
+                    $completion.completion, $completion.needBytes, $completion.needItems)
+                Write-Hint "如果长时间卡在此处，请到 Syncthing GUI 查看 folder 页面是否有 'Out of Sync' 或红色错误"
+                return $false
+            }
+        } else {
+            Write-Warn "无法获取远端完成度"
+            return $false
+        }
+    } catch {
+        Write-Warn "远端完成度检查失败：$($_.Exception.Message)"
+        return $false
+    }
+}
+
+# 单个 Vault 的双向共享：本地建立 folder + 服务器建立 folder + 建目录赋权 + 等待首次扫描
+function Add-OneSharedVault {
+    param([Parameter(Mandatory=$true)][string]$LocalPath)
+
+    $name = Split-Path -Path $LocalPath -Leaf
+    
+    # 优先使用已保存的文件夹ID，确保一致性
+    $folderId = $null
+    if ($global:SAVED_FOLDER_MAP -and $global:SAVED_FOLDER_MAP.ContainsKey($LocalPath)) {
+        $folderId = $global:SAVED_FOLDER_MAP[$LocalPath]
+        Write-Info ("═ 共享 [$name] ═（复用已保存的文件夹ID）")
+    } else {
+        $folderId = ConvertTo-FolderId -Name $name
+        Write-Info ("═ 共享 [$name] ═（新文件夹ID）")
+    }
+    
+    $remoteDir = ConvertTo-RemoteSafeName -Name $name
+    $remotePath = "$DEFAULT_REMOTE_ROOT/$remoteDir"
+
+    Write-Hint ("  folderID    = {0}" -f $folderId)
+    Write-Hint ("  local path  = {0}" -f $LocalPath)
+    Write-Hint ("  remote path = {0}" -f $remotePath)
+
+    # 1) 本地幂等：同路径已存在 → 复用原 folder id
+    $existId = Find-LocalFolderIdByPath -Path $LocalPath
+    $skipServerSetup = $false
+    
+    if ($existId) {
+        Write-Ok ("本地已存在同路径文件夹（id={0}），跳过本地添加" -f $existId)
+        # 重要修复：如果已保存的文件夹ID与本地现有ID不一致，优先使用已保存的ID以确保一致性
+        if ($global:SAVED_FOLDER_MAP -and $global:SAVED_FOLDER_MAP.ContainsKey($LocalPath) -and $global:SAVED_FOLDER_MAP[$LocalPath] -ne $existId) {
+            Write-Warn "检测到文件夹ID不一致：本地现有=$existId，已保存=$($global:SAVED_FOLDER_MAP[$LocalPath])"
+            Write-Warn "将强制使用已保存的文件夹ID以确保双向一致性"
+            $folderId = $global:SAVED_FOLDER_MAP[$LocalPath]
+        } else {
+            $folderId = $existId
+        }
+
+        # 幂等自愈①：本地 folder 存在，但 devices 里可能缺 REMOTE_DEVICE_ID
+        # （例如远端 Syncthing 重装导致远端 Device ID 变了）
+        $null = Update-FolderDevicesIfMissing -Scope local -FolderId $folderId -RequiredDeviceId $global:REMOTE_DEVICE_ID
+
+        # 如果本地已存在，检查服务器端是否也存在相同的文件夹ID
+        if (Test-FolderExists -Scope remote -FolderId $folderId) {
+            Write-Ok "服务器已存在 folder [$folderId]（幂等跳过）"
+            # 幂等自愈②：远端 folder 存在，但 devices 里可能缺 LOCAL_DEVICE_ID
+            # （这是老版本脚本的核心 bug：首次部署时本地 Device ID 读错了，
+            #  导致远端 folder 自始至终没把真·本地 device 列为 peer，于是从不同步）
+            $null = Update-FolderDevicesIfMissing -Scope remote -FolderId $folderId -RequiredDeviceId $global:LOCAL_DEVICE_ID
+            $skipServerSetup = $true
+        }
+    } else {
+        # 本地端：共享给 SELECTED_REMOTE_DEVICES 中所有的远端
+        $peers = if ($global:SELECTED_REMOTE_DEVICES -and $global:SELECTED_REMOTE_DEVICES.Count -gt 0) {
+            @($global:SELECTED_REMOTE_DEVICES)
+        } else {
+            @($global:REMOTE_DEVICE_ID)
+        }
+        $body = New-FolderJson -FolderId $folderId -Label $name -Path $LocalPath -PeerDeviceIds $peers
+        $null = Invoke-LocalApi -Method POST -Path "/rest/config/folders" -Body $body
+        $global:ROLLBACK_STACK += "local_folder:$folderId"
+        Write-Ok "本地 folder 已添加"
+    }
+
+    # 2) 服务器端：只有在需要时才设置
+    if (-not $skipServerSetup) {
+        # 服务器端：先建目录 + chown
+        Invoke-RemotePrepareFolderDir -RemotePath $remotePath
+
+        # 3) 服务器端幂等：folderId 已存在 → 跳过
+        if (Test-FolderExists -Scope remote -FolderId $folderId) {
+            Write-Ok "服务器已存在 folder [$folderId]（幂等跳过）"
+            # 幂等自愈：远端 folder 可能缺 LOCAL_DEVICE_ID（上一次运行时本地 ID 被读错）
+            $null = Update-FolderDevicesIfMissing -Scope remote -FolderId $folderId -RequiredDeviceId $global:LOCAL_DEVICE_ID
+        } else {
+            # 服务器端：仅与本地一台对端配对
+            $body = New-FolderJson -FolderId $folderId -Label $name -Path $remotePath -PeerDeviceIds @($global:LOCAL_DEVICE_ID)
+            $null = Invoke-RemoteApi -Method POST -Path "/rest/config/folders" -Body $body
+            $global:ROLLBACK_STACK += "remote_folder:$folderId"
+            Write-Ok "服务器 folder 已添加"
+            # 防御性兜底：POST 之后再读回一次，若 devices 丢失则补上
+            $null = Update-FolderDevicesIfMissing -Scope remote -FolderId $folderId -RequiredDeviceId $global:LOCAL_DEVICE_ID
+        }
+    }
+
+    # 4) 登记共享结果
+    $global:SHARED_FOLDERS += [pscustomobject]@{
+        FolderId   = $folderId
+        LocalPath  = $LocalPath
+        RemotePath = $remotePath
+        Label      = $name
+    }
+
+    # 5) 等待首次扫描
+    Wait-FolderScan -FolderId $folderId
+
+    # 6) 验证同步状态
+    $syncVerified = Verify-SyncStatus -FolderId $folderId -LocalPath $LocalPath
+    if (-not $syncVerified) {
+        Write-Warn "文件夹 [$folderId] 同步状态验证失败，请检查连接和权限"
+    } else {
+        Write-Ok "文件夹 [$folderId] 同步验证通过"
+    }
+}
+
+# 同步诊断工具
+function Diagnose-SyncIssues {
+    param(
+        [Parameter(Mandatory=$false)][string]$FolderId
+    )
+
+    Write-Step "同步问题诊断"
+
+    # 1. 检查本地Syncthing服务状态
+    Write-Info "检查本地Syncthing服务..."
+    try {
+        $ping = Invoke-LocalApi -Method GET -Path "/rest/system/ping" -Retries 2
+        if ($ping -and $ping.ping -eq "pong") {
+            Write-Ok "本地Syncthing服务运行正常"
+        } else {
+            Write-Warn "本地Syncthing服务异常"
+        }
+    } catch {
+        Write-Warn "无法连接本地Syncthing服务：$($_.Exception.Message)"
+    }
+
+    # 2. 检查设备连接状态
+    Write-Info "检查设备连接状态..."
+    try {
+        $connections = Invoke-LocalApi -Method GET -Path "/rest/system/connections" -Retries 2
+        if ($connections -and $connections.connections) {
+            foreach ($conn in $connections.connections.PSObject.Properties) {
+                $deviceId = $conn.Name
+                $status = $conn.Value
+                if ($deviceId -eq $global:REMOTE_DEVICE_ID) {
+                    if ($status.connected) {
+                        Write-Ok "远程设备连接正常"
+                    } else {
+                        Write-Warn "远程设备未连接"
+                        Write-Info "  - 错误信息: $($status.error)"
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Warn "连接状态检查失败：$($_.Exception.Message)"
+    }
+
+    # 3. 检查文件夹状态
+    if ($FolderId) {
+        Write-Info "检查文件夹 [$FolderId] 状态..."
+        try {
+            $folderStatus = Invoke-LocalApi -Method GET -Path "/rest/db/status?folder=$FolderId" -Retries 2
+            if ($folderStatus) {
+                Write-Info "文件夹状态："
+                Write-Info "  - 状态: $($folderStatus.state)"
+                Write-Info "  - 本地字节: $($folderStatus.localBytes)"
+                Write-Info "  - 全局字节: $($folderStatus.globalBytes)"
+                Write-Info "  - 需要字节: $($folderStatus.needBytes)"
+                Write-Info "  - 错误: $($folderStatus.error)"
+
+                if ($folderStatus.error) {
+                    Write-Warn "文件夹存在错误：$($folderStatus.error)"
+                }
+            }
+        } catch {
+            Write-Warn "文件夹状态检查失败：$($_.Exception.Message)"
+        }
+    }
+
+    # 4. 端口连通性检查
+    Write-Info "检查端口连通性..."
+    try {
+        $result = Test-NetConnection $global:REMOTE_HOST -Port 22000 -InformationLevel Quiet
+        if ($result) {
+            Write-Ok "端口22000连通性正常"
+        } else {
+            Write-Warn "端口22000无法连通，请检查防火墙和网络设置"
+        }
+    } catch {
+        Write-Warn "端口检查失败：$($_.Exception.Message)"
+    }
+
+    Write-Ok "诊断完成，请根据以上信息排查问题"
+}
+
+# 步骤 7 主入口
+function New-SharedFolders {
+    Write-Step "步骤 7/8：建立双向文件夹共享"
+
+    if (-not $global:SELECTED_VAULTS -or $global:SELECTED_VAULTS.Count -eq 0) {
+        throw "没有待共享的 Vault（SELECTED_VAULTS 为空）"
+    }
+
+    # 如果 SELECTED_REMOTE_DEVICES 没被填充，默认只共享给本次目标服务器
+    if (-not $global:SELECTED_REMOTE_DEVICES -or $global:SELECTED_REMOTE_DEVICES.Count -eq 0) {
+        $global:SELECTED_REMOTE_DEVICES = @($global:REMOTE_DEVICE_ID)
+    }
+
+    # 展示本次要共享到的远端设备
+    try {
+        $allDevices = Invoke-LocalApi -Method GET -Path "/rest/config/devices"
+        Write-Info ("本次将把新 Vault 共享给 {0} 个远端设备：" -f $global:SELECTED_REMOTE_DEVICES.Count)
+        foreach ($did in $global:SELECTED_REMOTE_DEVICES) {
+            $dname = "(未命名)"
+            if ($allDevices) {
+                foreach ($dev in $allDevices) {
+                    if ($dev.deviceID -eq $did) { $dname = $dev.name; break }
+                }
+            }
+            Write-Hint ("  ▸ {0}  ({1})" -f $dname, $did.Substring(0, [Math]::Min(7, $did.Length)))
+        }
+    } catch {
+        # 获取失败不阻断
+    }
+
+    foreach ($v in $global:SELECTED_VAULTS) {
+        Add-OneSharedVault -LocalPath $v
+    }
+    Write-Ok ("所有 {0} 个 Vault 共享配置已提交" -f $global:SELECTED_VAULTS.Count)
+}
+
+# ---------------------------------------------------------------------------
 # 模块：Windows 凭据管理
 # 设计说明：
 #   早期版本使用 PowerShell Gallery 上的第三方模块 CredentialManager 提供的
@@ -2812,17 +4504,45 @@ function Main {
         $adminMark = if (Test-IsAdministrator) { "[管理员]" } else { "[普通用户]" }
         Write-Host "运行身份: $adminMark" -ForegroundColor Gray
         Write-Host ""
-        
+
+        # 检查是否运行诊断模式
+        if ($args.Count -gt 0 -and $args[0] -eq "diagnose") {
+            Write-Host "运行同步问题诊断模式..." -ForegroundColor Yellow
+            Write-Host ""
+
+            # 加载上次运行的配置
+            if (Test-Path "$STATE_DIR\last-run.json") {
+                $lastConfig = Get-Content "$STATE_DIR\last-run.json" | ConvertFrom-Json
+                if ($lastConfig -and $lastConfig.server) {
+                    $global:SSH_HOST = $lastConfig.server.host
+                    $global:SSH_USER = $lastConfig.server.user
+                    $global:REMOTE_DEVICE_ID = $lastConfig.server.deviceID
+                    Write-Info "加载上次配置：服务器 $global:SSH_HOST，设备ID $global:REMOTE_DEVICE_ID"
+                }
+
+                if ($lastConfig.folders -and $lastConfig.folders.Count -gt 0) {
+                    $folderId = $lastConfig.folders[0].folderID
+                    Write-Info "诊断文件夹：$folderId"
+                    Diagnose-SyncIssues -FolderId $folderId
+                } else {
+                    Diagnose-SyncIssues
+                }
+            } else {
+                Diagnose-SyncIssues
+            }
+            return
+        }
+
         # 编码检测与修复（解决远程桌面乱码问题）
         Test-AndFix-Encoding
-        
+
         # 管理员权限检查（安装 Chocolatey / Windows 服务需要管理员）
         if (-not (Test-IsAdministrator)) {
             if (-not (Request-AdminElevation)) {
                 throw "需要管理员权限才能继续，请以管理员身份重新运行脚本"
             }
         }
-        
+
         # 创建状态目录
         if (-not (Test-Path $STATE_DIR)) {
             New-Item -ItemType Directory -Path $STATE_DIR -Force | Out-Null
@@ -2830,8 +4550,7 @@ function Main {
         }
         
         # 检查依赖
-        Check-Dependencies
-        
+        Check-Dependencies        
         # 收集用户输入
         Collect-UserInput
         
@@ -2846,10 +4565,21 @@ function Main {
         # 步骤 3/8：建立远端 API 通道与 GUI 凭证
         Invoke-RemoteApiTunnelSetup
         
-        Write-Host ""
-        Write-Warn "步骤 4/8 至 8/8 尚在实现中（本地 Syncthing 安装、设备配对、Vault 选择、文件夹共享、总结）"
-        Write-Hint "服务器端已配置完毕，Web UI：http://$($global:SSH_HOST):8384"
-        Write-Hint "  用户名：$($global:REMOTE_GUI_USER)   密码：$($global:REMOTE_GUI_PASS)"
+        # 步骤 4/8：本地 Windows Syncthing 安装与启动
+        Deploy-LocalSyncthing
+        
+        # 步骤 5/8：双向 Device ID 配对
+        Pair-Devices
+
+        # 步骤 6/8：选择要同步的 Obsidian Vault
+        Select-ObsidianVaults
+
+        # 步骤 7/8：建立双向共享文件夹
+        New-SharedFolders
+        
+        # 步骤 8/8：持久化状态 + 美化总结
+        Save-RunState
+        Write-Summary
         
     } catch {
         Write-Err "执行失败: $($_.Exception.Message)"
@@ -2858,6 +4588,127 @@ function Main {
         # 确保隧道被清理（即便后续步骤出错也不会遗留 plink 进程）
         Stop-SSHTunnel
     }
+}
+
+# ---------------------------------------------------------------------------
+# 模块：state —— 运行状态持久化（步骤 8/8 第一部分）
+#
+# 与 obsidian-sync.sh save_state() 行为对齐：
+#   - 写入路径：$env:USERPROFILE\.obsidian-sync\last-run.json
+#   - 敏感信息（密码/API Key）绝不写入此文件，只保存结构性元数据
+#   - 文件会被 Load-LastConfig 用作下次运行的默认值（主机、用户、端口）
+# ---------------------------------------------------------------------------
+function Save-RunState {
+    if (-not (Test-Path $STATE_DIR)) {
+        New-Item -ItemType Directory -Path $STATE_DIR -Force | Out-Null
+    }
+
+    # SHARED_FOLDERS 里每项是 [pscustomobject]@{ FolderId/LocalPath/RemotePath/Label }
+    # 转成 sh 版一样的 [{folderID, localPath, remotePath}]
+    $foldersArr = @()
+    foreach ($f in $global:SHARED_FOLDERS) {
+        $foldersArr += [pscustomobject]@{
+            folderID   = $f.FolderId
+            localPath  = $f.LocalPath
+            remotePath = $f.RemotePath
+            label      = $f.Label
+        }
+    }
+
+    $state = [ordered]@{
+        version   = $SCRIPT_VERSION
+        timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        server    = [ordered]@{
+            host       = $global:SSH_HOST
+            user       = $global:SSH_USER
+            port       = [int]$global:SSH_PORT
+            deviceID   = $global:REMOTE_DEVICE_ID
+            runUser    = $global:REMOTE_RUN_USER
+            configPath = $global:REMOTE_CONFIG_XML
+        }
+        local     = [ordered]@{
+            deviceID   = $global:LOCAL_DEVICE_ID
+            configPath = $LOCAL_SYNCTHING_CONFIG_XML
+        }
+        folders   = $foldersArr
+    }
+
+    try {
+        $json = $state | ConvertTo-Json -Depth 6
+        # PowerShell 5.1 的 ConvertTo-Json 默认用 UTF-16；强制 UTF-8 无 BOM，便于 sh/jq 读取
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($STATE_FILE, $json, $utf8NoBom)
+        Write-Ok "运行配置已保存至：$STATE_FILE"
+    } catch {
+        Write-Warn "保存运行配置失败（不影响本次部署结果）：$($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 模块：summary —— 部署总结（步骤 8/8 第二部分）
+#
+# 与 obsidian-sync.sh print_summary() 的内容结构对齐，但访问入口针对 Windows 特调：
+#   - sh 版告诉 Mac 用户"再开一个终端 ssh -L 隧道"
+#   - ps1 版直接给出 plink/ssh 两种写法；并明确 Windows 侧访问 127.0.0.1:8385
+# ---------------------------------------------------------------------------
+function Write-Summary {
+    Write-Step "步骤 8/8：完成"
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Green
+    Write-Host "║                  🎉  部  署  完  成                      ║" -ForegroundColor Green
+    Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Green
+    Write-Host ""
+
+    # ── 连接信息 ────────────────────────────────
+    Write-Host "🔗  连接信息" -ForegroundColor White
+    Write-Host ("   本地 Device ID    {0}" -f $global:LOCAL_DEVICE_ID)   -ForegroundColor Cyan
+    Write-Host ("   服务器 Device ID  {0}" -f $global:REMOTE_DEVICE_ID)  -ForegroundColor Cyan
+    Write-Host ("   服务器地址        {0}@{1}:{2}" -f $global:SSH_USER, $global:SSH_HOST, $global:SSH_PORT) -ForegroundColor White
+    Write-Host ""
+
+    # ── 共享文件夹 ──────────────────────────────
+    $folderCount = @($global:SHARED_FOLDERS).Count
+    Write-Host ("📁  共享文件夹  ({0} 个)" -f $folderCount) -ForegroundColor White
+    foreach ($f in $global:SHARED_FOLDERS) {
+        Write-Host ("   ▸ {0}" -f $f.FolderId) -ForegroundColor Green
+        Write-Host ("       本地   {0}" -f $f.LocalPath) -ForegroundColor Gray
+        Write-Host  "         ↕" -ForegroundColor Magenta
+        Write-Host ("       远端   {0}:{1}" -f $global:SSH_HOST, $f.RemotePath) -ForegroundColor Gray
+    }
+    Write-Host ""
+
+    # ── 访问入口 ────────────────────────────────
+    Write-Host "🌐  访问入口" -ForegroundColor White
+    Write-Host ("   本地 Syncthing GUI   {0}" -f $LOCAL_API_URL) -ForegroundColor Cyan
+    Write-Host "   远端 GUI（通过 SSH 隧道转发，安全加密）：" -ForegroundColor Gray
+    Write-Host "       第 1 步  在 Windows 另开一个 PowerShell 窗口，执行（任选其一）：" -ForegroundColor White
+    Write-Host ("         plink -ssh -N -L 8385:127.0.0.1:8384 -P {0} -l {1} {2}" -f $global:SSH_PORT, $global:SSH_USER, $global:SSH_HOST) -ForegroundColor DarkGray
+    Write-Host ("         ssh   -N -L 8385:127.0.0.1:8384 -p {0} {1}@{2}"          -f $global:SSH_PORT, $global:SSH_USER, $global:SSH_HOST) -ForegroundColor DarkGray
+    Write-Host "       第 2 步  在 Windows 浏览器访问（127.0.0.1 指的是本机，不是服务器）：" -ForegroundColor White
+    Write-Host "         http://127.0.0.1:8385" -ForegroundColor Cyan
+    Write-Host "       说明    远端 Syncthing GUI 只监听 127.0.0.1:8384，公网不可直连；" -ForegroundColor White
+    Write-Host "               通过 SSH 隧道把它安全转发到本机 8385 端口来访问。" -ForegroundColor White
+    if ($global:REMOTE_GUI_USER) {
+        Write-Host ("       登录账号  {0}  /  {1}" -f $global:REMOTE_GUI_USER, $global:REMOTE_GUI_PASS) -ForegroundColor White
+        Write-Host "                 (密码已加密保存到 Windows 凭据管理器，本地 Web UI 免密登录)" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+
+    # ── 日志位置 ────────────────────────────────
+    Write-Host "📝  日志 & 状态文件" -ForegroundColor White
+    Write-Host ("   本地 Syncthing 日志  {0}" -f $LOCAL_SYNCTHING_LOG) -ForegroundColor Gray
+    Write-Host ("   运行记录 (JSON)      {0}" -f $STATE_FILE)          -ForegroundColor Gray
+    Write-Host ("   脚本运行日志         {0}" -f $LOG_FILE)            -ForegroundColor Gray
+    Write-Host ""
+
+    # ── 下一步提示 ──────────────────────────────
+    Write-Host "💡  接下来" -ForegroundColor White
+    Write-Host "   • 在任一端新增 / 修改 / 删除笔记，另一端会自动同步" -ForegroundColor Green
+    Write-Host "   • 如果看到冲突文件（.sync-conflict-*），保留你想要的版本即可" -ForegroundColor Green
+    Write-Host "   • 想新增同步目录？再次运行本脚本，再选一次 Vault 即可（幂等）" -ForegroundColor Green
+    Write-Host "   • 本地 Syncthing 后台仍在运行（开机自启请自行加计划任务）；如需停止：" -ForegroundColor Green
+    Write-Host ("     Stop-Process -Id (Get-Content '{0}') -Force" -f $LOCAL_SYNCTHING_PID_FILE) -ForegroundColor DarkGray
+    Write-Host ""
 }
 
 function Collect-UserInput {
@@ -2902,6 +4753,14 @@ function Load-LastConfig {
             
             if (-not [string]::IsNullOrEmpty($global:SSH_HOST)) {
                 Write-Info "已从上次运行记录加载：$($global:SSH_USER)@$($global:SSH_HOST):$($global:SSH_PORT)"
+            }
+        }
+        
+        # 加载已保存的文件夹配置，确保文件夹ID一致性
+        if ($config -and $config.PSObject.Properties.Name -contains 'folders') {
+            $global:SAVED_FOLDERS = @($config.folders)
+            if ($global:SAVED_FOLDERS.Count -gt 0) {
+                Write-Info ("已加载 {0} 个已配置的文件夹" -f $global:SAVED_FOLDERS.Count)
             }
         }
     } catch {
