@@ -4,10 +4,52 @@
 
 ## 🚀 快速开始
 
-### 系统要求
-- **操作系统**: Windows 10/11
-- **PowerShell**: 5.1 或更高版本
-- **网络**: 可访问目标 Linux 服务器
+### 📋 前置条件（需要客户自备）
+
+> ⚠️ 以下 6 项是**脚本无法自动帮你搞定**的，必须先准备好，否则部署会在中途失败。
+
+| # | 项目 | 要求 | 说明 |
+|---|------|------|------|
+| 1 | **操作系统** | Windows 10 / Windows 11 | 旧版 Windows（7/8）未测试 |
+| 2 | **PowerShell** | **强烈推荐 7.x**；最低 5.1 | 见下方【为什么推荐 PS 7】 |
+| 3 | **管理员权限** | 必需 | 首次运行需要装 Chocolatey / PuTTY / OpenSSH 等 |
+| 4 | **一台 Linux 云服务器** | Debian / Ubuntu / RHEL / CentOS / Rocky 等，支持 `systemd`，账号具备 `sudo` 权限 | 若没有，可参考主 [README.md](README.md#-还没有自己的服务器一键部署-openclaw) 一键买/部署 |
+| 5 | **云厂商安全组放行** | `TCP 22`（SSH）+ `TCP 22000`（Syncthing）+ `UDP 22000`（QUIC）入站 | **安全组不放行，脚本就连不上；这不是脚本能替你做的** |
+| 6 | **网络可直连以下站点** | GitHub Releases、chocolatey.org、the.earth.li（PuTTY 官方下载） | 公司网 / 某些代理会拦截，必要时先挂上代理或换网络 |
+
+#### 💡 为什么推荐 PowerShell 7
+
+脚本代码本身兼容 **PS 5.1 / 7+ 双版本**，但在实际使用中 PS 5.1 存在以下痛点：
+
+- **代理环境容易卡死**：`Invoke-RestMethod` 在 PS 5.1 上无 `-NoProxy` 参数，遇到公司代理 / 全局代理时会把 `127.0.0.1:18384` 的流量也送去代理，导致长时间无响应（历次踩坑之一）。
+- **UTF-8 输出不稳定**：PS 5.1 默认仍是系统 ANSI/GBK 编码，远程桌面环境下容易中文乱码；PS 7 原生 UTF-8，即开即用。
+- **TLS 1.2 默认未启用**：PS 5.1 在 .NET Framework 下需要显式开启 TLS 1.2 才能拉 GitHub / Chocolatey；PS 7 直接可用。
+- **JSON / Web API 行为差异**：PS 7 的 `ConvertFrom-Json -AsHashtable`、`Invoke-RestMethod -SkipHttpErrorCheck` 等对诊断极有帮助。
+
+一句话：**能用 PS 7 就用 PS 7**，避坑最多。
+
+**安装 PowerShell 7**（任选一种）：
+
+```powershell
+# 方式 1：winget（推荐，Windows 10/11 自带）
+winget install --id Microsoft.PowerShell --source winget
+
+# 方式 2：Chocolatey（如果你已装了 choco）
+choco install powershell-core -y
+
+# 方式 3：官方 MSI 下载
+# https://github.com/PowerShell/PowerShell/releases/latest
+```
+
+安装完成后，用 `pwsh.exe` 启动 PowerShell 7（而不是默认的 `powershell.exe`）：
+
+```powershell
+# 检查当前 PowerShell 版本
+$PSVersionTable.PSVersion    # 应显示 7.x.x
+
+# 以管理员身份启动 PS 7
+Start-Process pwsh -Verb RunAs
+```
 
 ### 安装步骤
 
@@ -20,9 +62,14 @@
 
 2. **运行脚本**
    ```powershell
-   # 以管理员权限运行 PowerShell，然后执行：
+   # 推荐：以管理员身份启动 PowerShell 7（pwsh），然后执行：
+   pwsh -ExecutionPolicy Bypass -File obsidian-sync.ps1
+
+   # 或者兼容写法（PS 5.1 / PS 7 皆可）：
    PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
    ```
+
+   > 💡 如果 `pwsh` 命令找不到，说明还没装 PowerShell 7，回到上方【前置条件】安装一下即可。
 
 3. **跟随向导**
    - 脚本会自动检查并安装所需依赖
@@ -86,21 +133,55 @@ PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 -Action uninstall
 
 ## 🔧 依赖管理
 
-### 必需依赖
-脚本会自动检查并安装以下依赖：
+### 必需依赖（脚本会自动检查并安装）
 
 | 依赖 | 用途 | Windows 安装方式 |
 |------|------|------------------|
+| **Chocolatey** | 包管理器，后续所有依赖靠它 | 脚本自动安装；也可手动装（见下文） |
 | **OpenSSH** | SSH 客户端连接 | `choco install openssh -y` |
-| **curl** | HTTP API 调用 | `choco install curl -y` |
-| **Chocolatey** | 包管理器 | 自动安装 |
+| **curl** | HTTP API 调用 | Windows 10/11 自带；缺失时 `choco install curl -y` |
+| **plink.exe**（PuTTY） | **Windows 下非交互式 SSH 的首选**，脚本会优先用它替代 sshpass | `choco install putty.portable -y`；失败时脚本会自动从 the.earth.li 直连下载 |
 
 ### 可选依赖
 | 依赖 | 用途 | 安装方式 |
 |------|------|----------|
-| **sshpass** | 非交互式 SSH 登录 | `choco install sshpass -y` |
-| **jq** | JSON 解析 | `choco install jq -y` |
-| **fzf** | 目录多选界面 | `choco install fzf -y` |
+| **sshpass** | 非交互式 SSH 登录（plink 不可用时的备选） | `choco install sshpass -y` |
+| **jq** | JSON 解析（缺失时回退到 PowerShell 原生 `ConvertFrom-Json`） | `choco install jq -y` |
+| **fzf** | 目录多选 TUI（缺失时降级为数字菜单） | `choco install fzf -y` |
+
+## 🔥 云厂商安全组 / 防火墙放行清单（必做）
+
+> 脚本会自动配置**服务器内部**的 `ufw` / `firewalld`，但**云厂商控制台的安全组 / 轻量防火墙必须你自己在网页上点一下放行**，否则 SSH 都进不去，更别提同步。
+
+### ✅ 必须放行（缺一不可）
+
+| 协议/端口 | 方向 | 用途 | 建议来源 |
+|-----------|------|------|----------|
+| `TCP 22` | 入站 | SSH 登录 —— 脚本的一切远端操作都基于 SSH | 本机公网 IP/32 最佳 |
+| `TCP 22000` | 入站 | Syncthing 设备间同步（TCP 通道，文件主力传输） | `0.0.0.0/0` |
+| `UDP 22000` | 入站 | Syncthing 同步的 QUIC 通道（NAT 穿透 / 弱网主力） | `0.0.0.0/0` |
+
+### 🟡 可选放行
+
+| 协议/端口 | 方向 | 用途 | 说明 |
+|-----------|------|------|------|
+| `UDP 21027` | 入站 | Syncthing 局域网发现（广播） | 纯公网服务器基本用不上 |
+
+### 🔒 强烈建议「不要」对公网开放
+
+| 协议/端口 | 原因 |
+|-----------|------|
+| `TCP 8384` | Syncthing Web UI。脚本已通过 `ssh -L 18384:127.0.0.1:8384` 建立本地端口转发，你在本机访问的是 `http://127.0.0.1:18384`；**公网暴露 8384 = 任何人能扫到你的 Syncthing 后台**。 |
+
+**腾讯云控制台直达入口**
+- CVM 安全组：<https://console.cloud.tencent.com/cvm/securitygroup>
+- 轻量应用服务器防火墙：<https://console.cloud.tencent.com/lighthouse/instance/index> → 实例详情 → 防火墙
+
+**Windows 端快速自检端口连通性**（部署前先验一下）：
+```powershell
+Test-NetConnection <服务器IP> -Port 22       # SSH
+Test-NetConnection <服务器IP> -Port 22000    # Syncthing TCP
+```
 
 ## 🛠️ 手动安装依赖
 

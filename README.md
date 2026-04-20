@@ -29,6 +29,21 @@
 
 ## 🚀 快速开始
 
+### 📋 前置条件（需要客户自备）
+
+> ⚠️ 下面这几项是**脚本无法替你搞定**的，必须先准备好；其余依赖（`sshpass` / `jq` / `fzf` / 远端 Syncthing 等）脚本会自动检测并提示安装。
+
+| # | 项目 | 要求 | 说明 |
+|---|------|------|------|
+| 1 | **本地操作系统** | macOS 12+ 或主流 Linux 桌面版 | 脚本使用 bash 3.2+ 特性，macOS 自带 bash 即可，无需升级 |
+| 2 | **Homebrew**（仅 macOS）| 已安装 | 后续 `sshpass` / `jq` / `fzf` / `syncthing` 全靠它；<br>若未装：`/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` |
+| 3 | **一台 Linux 云服务器** | Debian / Ubuntu / RHEL / CentOS / Rocky 等，支持 `apt`/`dnf`/`yum` 任一；建议带 `systemd` | 若没有，请看 [☁️ 还没有自己的服务器？一键部署 OpenClaw](#️-还没有自己的服务器一键部署-openclaw) |
+| 4 | **服务器 sudo 权限** | 能通过 SSH 密码 或 SSH 密钥登录，且该账号可执行 `sudo` | 脚本需要 sudo 才能装 syncthing / 写 systemd 单元 / 改防火墙 |
+| 5 | **云厂商安全组放行** | `TCP 22`（SSH）+ `TCP 22000`（Syncthing）+ `UDP 22000`（QUIC）入站 | 见下文【🔥 云厂商安全组 / 防火墙放行清单】；**安全组不放行，脚本就连不上** |
+| 6 | **本地到 GitHub 的出网** | 能直连 github.com、syncthing 的 Release 页 | 公司网/代理会拦时请先挂代理 |
+
+脚本自身依赖（`ssh`/`curl`/`sshpass`/`jq`/`fzf`）的详细列表见下方 [📦 系统要求](#-系统要求)。
+
 ### 🍎 macOS / Linux 版本
 
 ```bash
@@ -45,10 +60,13 @@ chmod +x obsidian-sync.sh
 
 ### 🪟 Windows 版本
 
-请查看 [Windows 版本文档](README-Windows.md) 获取完整的 PowerShell 使用说明。
+> 📘 Windows 有自己的前置条件（**强烈推荐 PowerShell 7**、管理员权限、云安全组等），请务必先看 [Windows 版本文档 · 前置条件](README-Windows.md#-前置条件需要客户自备)。
 
 ```powershell
-# 以管理员权限运行 PowerShell，然后执行：
+# 推荐：以管理员身份启动 PowerShell 7（pwsh），然后执行：
+pwsh -ExecutionPolicy Bypass -File obsidian-sync.ps1
+
+# 兼容写法（PS 5.1 / PS 7 皆可，PS 5.1 在代理/乱码场景下可能踩坑）：
 PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
 ```
 
@@ -99,9 +117,14 @@ PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
 
 ### 🚀 Windows 快速开始
 ```powershell
-# 以管理员权限运行 PowerShell，然后执行：
+# 推荐：以管理员身份启动 PowerShell 7（pwsh），然后执行：
+pwsh -ExecutionPolicy Bypass -File obsidian-sync.ps1
+
+# 兼容写法（PS 5.1 / PS 7 皆可）：
 PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
 ```
+
+> ⚠️ Windows 侧还有**管理员权限 / 云安全组放行 / 网络直连 GitHub·Chocolatey·PuTTY 官方源**等前置条件，详见 [Windows 版本文档 · 前置条件](README-Windows.md#-前置条件需要客户自备)。
 
 ### 🔧 Windows 特有功能
 - **Chocolatey 包管理** - 自动安装依赖
