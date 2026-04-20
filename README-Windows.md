@@ -35,10 +35,7 @@
 
 ```powershell
 # 运行同步问题诊断
-PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 diagnose
-
-# 诊断特定文件夹
-PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 diagnose -FolderId Win10-vaulte-4l5us
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 -Action diagnose
 ```
 
 诊断功能会检查：
@@ -49,6 +46,28 @@ PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 diagnose -FolderId Wi
 - ✅ 错误信息分析
 
 详细诊断指南请参考：[SYNC-DIAGNOSIS.md](SYNC-DIAGNOSIS.md)
+
+### 🧹 管理与卸载
+
+脚本通过 `-Action` 参数统一管理部署后的生命周期；不传参数会弹出交互菜单：
+
+```powershell
+# 部署或新增 Vault（默认）
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 -Action deploy
+
+# 取消某个 folder 的双向共享（可选级联删数据）
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 -Action remove-folder
+
+# 解除本地 ↔ 服务器 的设备配对（可顺带清理两端 folder 配置）
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 -Action unpair
+
+# 完全卸载：停止并清理两端 Syncthing、删除本地凭据和 state 目录
+# 默认不删 Vault 笔记文件，会二次确认
+PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1 -Action uninstall
+```
+
+所有破坏性操作均提供二次确认，且**默认不删除用户数据**，只有显式选择才会级联删除。
+
 
 ## 📋 功能特性
 

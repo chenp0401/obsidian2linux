@@ -13,7 +13,22 @@
 #     state         —— 运行状态持久化
 #
 #   使用：PowerShell -ExecutionPolicy Bypass -File obsidian-sync.ps1
+#
+#   支持的动作（-Action 参数，不传时弹出交互菜单）：
+#     deploy         —— 向导式部署/增量添加 Vault
+#     remove-folder  —— 交互式取消某个 folder 的双向共享（可选级联删除数据）
+#     unpair         —— 解除本地与服务器的设备配对（顺带清理两端关联 folder）
+#     uninstall      —— 彻底卸载：停止两端 Syncthing、删配置/凭据/state（可选删 Vault）
+#     diagnose       —— 同步问题诊断
 # ============================================================================
+
+# ---------------------------------------------------------------------------
+# 顶层参数：param() 必须是脚本的第一条可执行语句
+# ---------------------------------------------------------------------------
+param(
+    [ValidateSet('deploy', 'remove-folder', 'unpair', 'uninstall', 'diagnose', 'menu')]
+    [string]$Action = 'menu'
+)
 
 # 设置错误处理
 $ErrorActionPreference = "Stop"
@@ -4754,6 +4769,69 @@ function Diagnose-SyncIssues {
         Write-Warn "端口检查失败：$($_.Exception.Message)"
     }
 
+    # 5. 远端 folder marker (.stfolder) 检查
+    # 这是 Syncthing v2 最隐蔽的"卡同步"元凶之一：folder 根目录下缺失 .stfolder 时，
+    # 服务端 state=idle、日志静默，但 completion 永远不到 100%。本脚本在部署阶段已
+    # 会自动建 marker，这里再做一次诊断时的兜底检查，便于排查历史遗留环境。
+    Write-Info "检查远端 folder marker (.stfolder)..."
+    $missingMarkers = @()
+    try {
+        $remoteFolders = Invoke-RemoteApi -Method GET -Path "/rest/config/folders" -Retries 2
+        if ($remoteFolders) {
+            foreach ($rf in $remoteFolders) {
+                if ([string]::IsNullOrEmpty($rf.path)) { continue }
+                # 只检查绝对路径（相对路径说明该 folder 本身还有 path-bug，留给 Repair 流程处理）
+                if (-not $rf.path.StartsWith("/")) {
+                    Write-Hint ("folder [{0}] path 为相对路径 '{1}'，跳过 marker 检查（建议先用部署流程修正 path）" -f $rf.id, $rf.path)
+                    continue
+                }
+                $pathEsc = ($rf.path -replace '"','\"')
+                $probe = @"
+sudo_cmd=""; [ "`$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+if [ -d "$pathEsc/.stfolder" ]; then echo "OK:$pathEsc"; else echo "MISSING:$pathEsc"; fi
+"@
+                try {
+                    $pr = Invoke-SSHScript -Script $probe -ThrowOnError
+                    if ($pr.Output -match 'MISSING:') {
+                        Write-Warn ("folder [{0}] 缺失 .stfolder marker → {1}" -f $rf.id, $rf.path)
+                        $missingMarkers += [pscustomobject]@{ Id = $rf.id; Path = $rf.path }
+                    } elseif ($pr.Output -match 'OK:') {
+                        Write-Ok ("folder [{0}] marker 正常" -f $rf.id)
+                    }
+                } catch {
+                    Write-Warn ("folder [{0}] marker 探测失败：{1}" -f $rf.id, $_.Exception.Message)
+                }
+            }
+        }
+    } catch {
+        Write-Warn "远端 folder 列表获取失败：$($_.Exception.Message)"
+    }
+
+    # 6. 若检测到 marker 缺失，询问是否自动修复
+    if ($missingMarkers.Count -gt 0) {
+        Write-Host ""
+        Write-Warn ("共发现 {0} 个 folder 缺失 .stfolder marker，这会导致服务端拒绝接收同步数据。" -f $missingMarkers.Count)
+        if (Confirm "是否立即自动补建所有缺失的 marker？" "Y") {
+            foreach ($m in $missingMarkers) {
+                try {
+                    Invoke-RemotePrepareFolderDir -RemotePath $m.Path
+                    Write-Ok ("folder [{0}] marker 已补建：{1}/.stfolder" -f $m.Id, $m.Path)
+                    # 补完 marker 后触发一次服务端 rescan，让 Syncthing 立即重新评估
+                    try {
+                        $null = Invoke-RemoteApi -Method POST -Path ("/rest/db/scan?folder={0}" -f $m.Id) -Retries 1
+                        Write-Hint ("已触发服务端 rescan：{0}" -f $m.Id)
+                    } catch {
+                        Write-Hint ("触发 rescan 失败（不影响 marker 修复本身）：{0}" -f $_.Exception.Message)
+                    }
+                } catch {
+                    Write-Warn ("folder [{0}] marker 补建失败：{1}" -f $m.Id, $_.Exception.Message)
+                }
+            }
+        } else {
+            Write-Info ("已跳过自动修复；可手动执行：ssh {0}@{1} 'mkdir -p <folder-path>/.stfolder'" -f $global:REMOTE_USER, $global:REMOTE_HOST)
+        }
+    }
+
     Write-Ok "诊断完成，请根据以上信息排查问题"
 }
 
@@ -5091,6 +5169,11 @@ function Write-Summary {
     Write-Host "   • 在任一端新增 / 修改 / 删除笔记，另一端会自动同步" -ForegroundColor Green
     Write-Host "   • 如果看到冲突文件（.sync-conflict-*），保留你想要的版本即可" -ForegroundColor Green
     Write-Host "   • 想新增同步目录？再次运行本脚本，再选一次 Vault 即可（幂等）" -ForegroundColor Green
+    Write-Host "   • 管理现有配置（新增功能）：" -ForegroundColor Green
+    Write-Host "       .\obsidian-sync.ps1 -Action remove-folder   # 取消某个 folder 的共享" -ForegroundColor DarkGray
+    Write-Host "       .\obsidian-sync.ps1 -Action unpair          # 解除本地 ↔ 服务器 的设备配对" -ForegroundColor DarkGray
+    Write-Host "       .\obsidian-sync.ps1 -Action uninstall       # 彻底卸载（两端）" -ForegroundColor DarkGray
+    Write-Host "       .\obsidian-sync.ps1 -Action diagnose        # 同步问题诊断" -ForegroundColor DarkGray
     Write-Host "   • 本地 Syncthing 后台仍在运行（开机自启请自行加计划任务）；如需停止：" -ForegroundColor Green
     Write-Host ("     Stop-Process -Id (Get-Content '{0}') -Force" -f $LOCAL_SYNCTHING_PID_FILE) -ForegroundColor DarkGray
     Write-Host ""
@@ -5153,5 +5236,798 @@ function Load-LastConfig {
     }
 }
 
+# ============================================================================
+# 模块：management —— 删除/解除配对/卸载（D 方案）
+#
+# 设计原则：
+#   - 不重复"部署向导"的所有步骤；这些动作只需要足够的上下文即可：
+#       SSH 连接 + 远端 API 隧道 + 本地 API Key
+#   - 对 Syncthing 两端的变更优先走 REST API（DELETE /rest/config/folders|devices/{id}）
+#   - 所有破坏性操作都二次确认；数据默认保留，只有用户显式同意才删除
+#   - uninstall 是终极回收：幂等、失败可重跑；保留 Vault 笔记是默认行为（永远别误删）
+# ============================================================================
+
+# 管理类动作的"轻量上下文初始化"：
+#   1) 读 last-run.json（拿默认 host / folders / deviceID）
+#   2) 交互采集 SSH（复用 Collect-UserInput，已从 last-run 预填）
+#   3) SSH 连通性测试
+#   4) 拿远端 API Key（Read-RemoteIdentity）+ 架起隧道
+#   5) 读本地 config.xml 拿 LOCAL_API_KEY / LOCAL_DEVICE_ID（若本地 Syncthing 已安装）
+#
+# 参数：
+#   -RequireLocalApi  本地 API 是否必须就绪（remove-folder / unpair 需要；uninstall 可选）
+#   -RequireRemoteApi 远端 API 是否必须就绪（remove-folder / unpair 需要）
+function Initialize-ManagementContext {
+    param(
+        [switch]$RequireLocalApi,
+        [switch]$RequireRemoteApi
+    )
+
+    # 编码 + 状态目录（与 Main 保持一致的前置准备）
+    Test-AndFix-Encoding
+    if (-not (Test-Path $STATE_DIR)) {
+        New-Item -ItemType Directory -Path $STATE_DIR -Force | Out-Null
+    }
+
+    # 加载上次运行记录（填充 SSH_HOST / SAVED_FOLDERS 等默认值）
+    Load-LastConfig
+
+    # 交互采集 SSH（即便上次有记录，也允许用户改）
+    Collect-UserInput
+
+    if (-not (Test-SSHConnection)) {
+        throw "SSH 连接测试失败，无法继续管理操作"
+    }
+
+    if ($RequireRemoteApi) {
+        # 不调用 Deploy-RemoteSyncthing（那是装机脚本），只复用拿 API Key 和建隧道两个轻量步骤
+        # 但 Read-RemoteIdentity 依赖 $global:REMOTE_CONFIG_XML，管理类动作必须先解析出它
+        Resolve-RemoteConfigXml
+        try {
+            Read-RemoteIdentity
+        } catch {
+            throw "读取远端 Syncthing 身份失败：$($_.Exception.Message)；服务器上可能已没有 Syncthing，可改用 -Action uninstall 直接清理本地"
+        }
+        try {
+            New-SSHTunnel
+            Wait-RemoteApiReady
+        } catch {
+            throw "建立远端 API 隧道失败：$($_.Exception.Message)"
+        }
+    }
+
+    if ($RequireLocalApi) {
+        if (-not (Test-Path $LOCAL_SYNCTHING_CONFIG_XML)) {
+            throw "未找到本地 Syncthing 配置：$LOCAL_SYNCTHING_CONFIG_XML；本机可能从未部署过 Syncthing"
+        }
+        Read-LocalIdentity
+        # 需要本地进程在跑才能走 API；若没跑就跳过提示，由上层决定
+        try {
+            $null = Invoke-LocalApi -Method GET -Path "/rest/system/status" -Retries 2
+        } catch {
+            throw "本地 Syncthing API 不可达：请先手动启动本地 Syncthing（或运行默认部署命令），或改用 -Action uninstall 做纯离线清理"
+        }
+        # 刷新权威 Device ID
+        try { Confirm-LocalDeviceIdViaApi } catch { }
+    }
+}
+
+# 从 last-run.json 恢复 REMOTE_DEVICE_ID（Initialize-ManagementContext 不一定会重新拿）
+function Restore-RemoteDeviceIdFromState {
+    if (-not (Test-Path $STATE_FILE)) { return }
+    try {
+        $cfg = Get-Content $STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($cfg -and $cfg.PSObject.Properties.Name -contains 'server' `
+            -and $cfg.server.PSObject.Properties.Name -contains 'deviceID' `
+            -and -not [string]::IsNullOrEmpty($cfg.server.deviceID)) {
+            $global:REMOTE_DEVICE_ID = [string]$cfg.server.deviceID
+        }
+    } catch { }
+}
+
+# 解析远端 Syncthing config.xml 的绝对路径，填充 $global:REMOTE_CONFIG_XML。
+# 管理类动作（remove-folder / unpair / diagnose）不会走 Deploy-RemoteSyncthing，
+# 所以要独立恢复这个变量。优先级：
+#   1) last-run.json 的 server.configPath（最可靠）
+#   2) 如果文件存在则直接用
+#   3) 通过 SSH 探测常见候选路径（v2 优先：~/.local/state/syncthing/config.xml；
+#      v1：~/.config/syncthing/config.xml；同时尝试 /root 绝对路径兜底 root 用户）
+function Resolve-RemoteConfigXml {
+    # 1) 先从 last-run.json 取
+    if ([string]::IsNullOrEmpty($global:REMOTE_CONFIG_XML) -and (Test-Path $STATE_FILE)) {
+        try {
+            $cfg = Get-Content $STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($cfg -and $cfg.PSObject.Properties.Name -contains 'server' `
+                -and $cfg.server.PSObject.Properties.Name -contains 'configPath' `
+                -and -not [string]::IsNullOrEmpty($cfg.server.configPath)) {
+                $global:REMOTE_CONFIG_XML = [string]$cfg.server.configPath
+                Write-Info "从 last-run.json 恢复远端配置路径：$($global:REMOTE_CONFIG_XML)"
+            }
+        } catch { }
+    }
+
+    # 2) 如果 last-run.json 里有路径，先 SSH 确认一下真的存在（避免旧配置或路径漂移）
+    if (-not [string]::IsNullOrEmpty($global:REMOTE_CONFIG_XML)) {
+        try {
+            # 注意：路径里可能有空格和特殊字符，用单引号包起来
+            $safe = $global:REMOTE_CONFIG_XML -replace "'", "'\\''"
+            $probe = Invoke-SSHCommand -Command "test -f '$safe' && echo FOUND || echo MISSING"
+            $probeText = ($probe | Out-String).Trim()
+            if ($probeText -match "FOUND") {
+                return
+            } else {
+                Write-Warn "last-run.json 里记录的 config.xml 在服务器上已不存在：$($global:REMOTE_CONFIG_XML)"
+                $global:REMOTE_CONFIG_XML = ""
+            }
+        } catch {
+            Write-Warn "验证远端 config.xml 路径失败：$($_.Exception.Message)"
+            $global:REMOTE_CONFIG_XML = ""
+        }
+    }
+
+    # 3) 探测常见候选路径
+    Write-Info "探测服务器端 Syncthing config.xml 的实际路径..."
+    $probeScript = @'
+set -e
+# 依次探测：当前用户 home + /root + 运行 Syncthing 的服务账户
+CANDIDATES=""
+for base in "$HOME" "/root" "/home/$(whoami)"; do
+    CANDIDATES="$CANDIDATES $base/.local/state/syncthing/config.xml"
+    CANDIDATES="$CANDIDATES $base/.config/syncthing/config.xml"
+done
+# 若存在 syncthing 进程，从 ps 命令行里抓 -home / --home 参数
+HOME_FROM_PS=$(ps -eo args 2>/dev/null | grep -E 'syncthing' | grep -Eo 'home[= ][^ ]+' | head -1 | awk -F'[= ]' '{print $2}')
+if [ -n "$HOME_FROM_PS" ]; then
+    CANDIDATES="$HOME_FROM_PS/config.xml $CANDIDATES"
+fi
+# 兜底：find 一遍最常见的路径（限制深度避免慢）
+FIND_RESULT=$(find /root /home -maxdepth 5 -name "config.xml" -path "*syncthing*" 2>/dev/null | head -5)
+CANDIDATES="$CANDIDATES $FIND_RESULT"
+
+FOUND=""
+for p in $CANDIDATES; do
+    if [ -f "$p" ] && grep -q "<apikey>" "$p" 2>/dev/null; then
+        FOUND="$p"
+        break
+    fi
+done
+# root 权限兜底
+if [ -z "$FOUND" ] && command -v sudo >/dev/null 2>&1; then
+    for p in $CANDIDATES; do
+        if sudo test -f "$p" 2>/dev/null && sudo grep -q "<apikey>" "$p" 2>/dev/null; then
+            FOUND="$p"
+            break
+        fi
+    done
+fi
+echo "CONFIG_XML=$FOUND"
+'@
+    try {
+        $r = Invoke-SSHScript -Script $probeScript
+        $found = Get-KVValue -Text $r.Output -Key "CONFIG_XML"
+        if (-not [string]::IsNullOrEmpty($found)) {
+            $global:REMOTE_CONFIG_XML = $found.Trim()
+            Write-Ok "探测到远端 config.xml：$($global:REMOTE_CONFIG_XML)"
+            return
+        }
+    } catch {
+        Write-Warn "探测远端 config.xml 失败：$($_.Exception.Message)"
+    }
+
+    throw "无法定位远端 Syncthing 配置文件（config.xml）；服务器上可能已没有 Syncthing，可改用 -Action uninstall 直接清理本地"
+}
+
+# 从两端 API 列出所有与本次配对相关的 folders（合并去重）
+# 返回数组：[{FolderId, Label, LocalPath, RemotePath, OnLocal, OnRemote}]
+function Get-ManagedFolderInventory {
+    $inv = @{}  # key = folderID
+
+    # StrictMode 下安全读属性：不存在返回默认值
+    $getProp = {
+        param($obj, $name, $default = "")
+        if ($null -eq $obj) { return $default }
+        try {
+            if ($obj.PSObject.Properties.Name -contains $name) {
+                $v = $obj.PSObject.Properties[$name].Value
+                if ($null -eq $v) { return $default }
+                return $v
+            }
+        } catch { }
+        return $default
+    }
+
+    # 本地
+    try {
+        $lf = Invoke-LocalApi -Method GET -Path "/rest/config/folders"
+        $lfArr = @($lf)
+        Write-Info ("本地读取到 {0} 个 folder" -f $lfArr.Count)
+        foreach ($f in $lfArr) {
+            $id = [string](& $getProp $f 'id')
+            if ([string]::IsNullOrEmpty($id)) { continue }
+            if (-not $inv.ContainsKey($id)) {
+                $inv[$id] = [pscustomobject]@{
+                    FolderId   = $id
+                    Label      = [string](& $getProp $f 'label')
+                    LocalPath  = [string](& $getProp $f 'path')
+                    RemotePath = ""
+                    OnLocal    = $true
+                    OnRemote   = $false
+                }
+            } else {
+                $inv[$id].OnLocal = $true
+                if (-not $inv[$id].LocalPath) { $inv[$id].LocalPath = [string](& $getProp $f 'path') }
+                if (-not $inv[$id].Label)     { $inv[$id].Label     = [string](& $getProp $f 'label') }
+            }
+        }
+    } catch {
+        Write-Warn "读取本地 folders 列表失败：$($_.Exception.Message)"
+    }
+
+    # 远端
+    try {
+        $rf = Invoke-RemoteApi -Method GET -Path "/rest/config/folders"
+        $rfArr = @($rf)
+        Write-Info ("远端读取到 {0} 个 folder" -f $rfArr.Count)
+        foreach ($f in $rfArr) {
+            $id = [string](& $getProp $f 'id')
+            if ([string]::IsNullOrEmpty($id)) { continue }
+            if (-not $inv.ContainsKey($id)) {
+                $inv[$id] = [pscustomobject]@{
+                    FolderId   = $id
+                    Label      = [string](& $getProp $f 'label')
+                    LocalPath  = ""
+                    RemotePath = [string](& $getProp $f 'path')
+                    OnLocal    = $false
+                    OnRemote   = $true
+                }
+            } else {
+                $inv[$id].OnRemote   = $true
+                $inv[$id].RemotePath = [string](& $getProp $f 'path')
+            }
+        }
+    } catch {
+        Write-Warn "读取远端 folders 列表失败：$($_.Exception.Message)"
+    }
+
+    # 用 last-run.json 补齐 RemotePath/LocalPath（API 只返回自己那端看到的路径）
+    try {
+        if (Test-Path $STATE_FILE) {
+            $cfg = Get-Content $STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $cfg -and $cfg.PSObject.Properties.Name -contains 'folders') {
+                $savedFolders = @($cfg.folders)
+                foreach ($sf in $savedFolders) {
+                    $fid = [string](& $getProp $sf 'folderID')
+                    if ([string]::IsNullOrEmpty($fid)) { continue }
+                    if ($inv.ContainsKey($fid)) {
+                        $lp = [string](& $getProp $sf 'localPath')
+                        $rp = [string](& $getProp $sf 'remotePath')
+                        $lb = [string](& $getProp $sf 'label')
+                        if (-not $inv[$fid].LocalPath  -and $lp) { $inv[$fid].LocalPath  = $lp }
+                        if (-not $inv[$fid].RemotePath -and $rp) { $inv[$fid].RemotePath = $rp }
+                        if (-not $inv[$fid].Label      -and $lb) { $inv[$fid].Label      = $lb }
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Warn "补齐路径信息失败：$($_.Exception.Message)"
+    }
+
+    # 强制把返回值包成数组（即使只有 0 或 1 个元素也是数组）
+    $result = @()
+    foreach ($k in $inv.Keys) { $result += $inv[$k] }
+    return ,($result | Sort-Object FolderId)
+}
+
+# 交互让用户多选一个 folder 列表。返回选中项（可能为空数组）
+function Select-FoldersInteractive {
+    param(
+        [Parameter(Mandatory=$true)][array]$Folders,
+        [string]$Prompt = "请选择要处理的 folder"
+    )
+    if (-not $Folders -or $Folders.Count -eq 0) {
+        Write-Warn "没有可选的 folder"
+        return @()
+    }
+
+    Write-Host ""
+    Write-Host $Prompt -ForegroundColor White
+    for ($i = 0; $i -lt $Folders.Count; $i++) {
+        $f = $Folders[$i]
+        $flag = ""
+        if     ($f.OnLocal -and $f.OnRemote) { $flag = "[双端]" }
+        elseif ($f.OnLocal)                  { $flag = "[仅本地]" }
+        elseif ($f.OnRemote)                 { $flag = "[仅远端]" }
+        $label = if ($f.Label) { $f.Label } else { "(无 label)" }
+        Write-Host ("  {0,2}) {1}  {2}" -f ($i + 1), $f.FolderId, $flag) -ForegroundColor Cyan
+        Write-Host ("        label: {0}" -f $label) -ForegroundColor Gray
+        if ($f.LocalPath)  { Write-Host ("        本地  : {0}" -f $f.LocalPath)  -ForegroundColor Gray }
+        if ($f.RemotePath) { Write-Host ("        远端  : {0}" -f $f.RemotePath) -ForegroundColor Gray }
+    }
+    Write-Host ("  {0,2}) 全部" -f ($Folders.Count + 1)) -ForegroundColor Yellow
+    Write-Host ("   0) 取消") -ForegroundColor DarkGray
+    Write-Host ""
+    $ans = Read-WithDefault "输入序号（多个用逗号或空格分隔，* 表示全部）" "0"
+    if ($ans -eq "0" -or [string]::IsNullOrWhiteSpace($ans)) { return @() }
+
+    # 支持 "all" / "*" / 最后一个序号
+    $ansTrim = $ans.Trim()
+    if ($ansTrim -eq "*" -or $ansTrim.ToLower() -eq "all") {
+        return $Folders
+    }
+    $nTmp = 0
+    if ([int]::TryParse($ansTrim, [ref]$nTmp) -and $nTmp -eq ($Folders.Count + 1)) {
+        return $Folders
+    }
+
+    $picked = @()
+    foreach ($part in ($ans -split '[\s,]+')) {
+        if ([string]::IsNullOrWhiteSpace($part)) { continue }
+        $n = 0
+        if ([int]::TryParse($part, [ref]$n)) {
+            if ($n -ge 1 -and $n -le $Folders.Count) {
+                $picked += $Folders[$n - 1]
+            } elseif ($n -eq ($Folders.Count + 1)) {
+                return $Folders
+            }
+        }
+    }
+    # 去重
+    $picked = @($picked | Sort-Object -Property FolderId -Unique)
+    return $picked
+}
+
+# 两端 DELETE 单个 folder（幂等；不存在就吞掉 404）
+function Invoke-DeleteFolderBothSides {
+    param(
+        [Parameter(Mandatory=$true)][string]$FolderId,
+        [switch]$SkipLocal,
+        [switch]$SkipRemote
+    )
+
+    if (-not $SkipLocal) {
+        try {
+            $null = Invoke-LocalApi -Method DELETE -Path "/rest/config/folders/$FolderId" -Retries 2
+            Write-Ok "已从本地 Syncthing 移除 folder [$FolderId]"
+        } catch {
+            Write-Warn "本地移除 folder [$FolderId] 失败（可能本来就不存在）：$($_.Exception.Message)"
+        }
+    }
+    if (-not $SkipRemote) {
+        try {
+            $null = Invoke-RemoteApi -Method DELETE -Path "/rest/config/folders/$FolderId" -Retries 2
+            Write-Ok "已从远端 Syncthing 移除 folder [$FolderId]"
+        } catch {
+            Write-Warn "远端移除 folder [$FolderId] 失败（可能本来就不存在）：$($_.Exception.Message)"
+        }
+    }
+}
+
+# 删除 last-run.json 中的 folder 记录（保持 state 一致）
+function Remove-FolderFromState {
+    param([Parameter(Mandatory=$true)][string[]]$FolderIds)
+    if (-not (Test-Path $STATE_FILE)) { return }
+    try {
+        $cfg = Get-Content $STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not ($cfg.PSObject.Properties.Name -contains 'folders')) { return }
+        $remaining = @()
+        foreach ($sf in @($cfg.folders)) {
+            if ($FolderIds -notcontains [string]$sf.folderID) { $remaining += $sf }
+        }
+        $cfg | Add-Member -MemberType NoteProperty -Name folders -Value $remaining -Force
+        $json = $cfg | ConvertTo-Json -Depth 6
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($STATE_FILE, $json, $utf8NoBom)
+    } catch {
+        Write-Warn "同步更新 last-run.json 失败：$($_.Exception.Message)"
+    }
+}
+
+# -------- Action: remove-folder --------
+function Invoke-RemoveFolderAction {
+    Write-Host ""
+    Write-Host "=== Obsidian 同步工具 · 取消 folder 共享 ===" -ForegroundColor Cyan
+    Write-Host "版本: $SCRIPT_VERSION" -ForegroundColor Gray
+    Write-Host ""
+
+    Initialize-ManagementContext -RequireLocalApi -RequireRemoteApi
+    Restore-RemoteDeviceIdFromState
+
+    Write-Step "扫描两端已存在的 folder"
+    $inventory = @(Get-ManagedFolderInventory)
+    if ($inventory.Count -eq 0) {
+        Write-Ok "没有任何 folder 需要处理"
+        return
+    }
+
+    $picked = @(Select-FoldersInteractive -Folders $inventory -Prompt "请选择要『取消共享』的 folder（可多选）")
+    if ($picked.Count -eq 0) {
+        Write-Info "已取消"
+        return
+    }
+
+    Write-Host ""
+    Write-Host "将对以下 folder 执行『取消共享』：" -ForegroundColor Yellow
+    foreach ($f in $picked) {
+        Write-Host ("  ▸ {0}  ({1})" -f $f.FolderId, $f.Label) -ForegroundColor White
+    }
+    Write-Host ""
+    $deleteData = Confirm "同时删除两端的实际数据目录？（选 N 只取消共享，数据保留）" "N"
+    if (-not (Confirm "确认执行以上操作？此操作不可逆" "N")) {
+        Write-Info "已取消"
+        return
+    }
+
+    foreach ($f in $picked) {
+        Write-Info ("═ 处理 {0} ═" -f $f.FolderId)
+        Invoke-DeleteFolderBothSides -FolderId $f.FolderId
+
+        if ($deleteData) {
+            # 本地目录
+            if ($f.LocalPath -and (Test-Path $f.LocalPath)) {
+                try {
+                    Remove-Item -Path $f.LocalPath -Recurse -Force -ErrorAction Stop
+                    Write-Ok ("已删除本地目录：{0}" -f $f.LocalPath)
+                } catch {
+                    Write-Warn ("删除本地目录失败：{0}：{1}" -f $f.LocalPath, $_.Exception.Message)
+                }
+            }
+            # 远端目录
+            if ($f.RemotePath) {
+                try {
+                    $safePath = $f.RemotePath -replace "'", "'\\''"
+                    $null = Invoke-SSHCommand -Command "rm -rf -- '$safePath'"
+                    Write-Ok ("已删除远端目录：{0}" -f $f.RemotePath)
+                } catch {
+                    Write-Warn ("删除远端目录失败：{0}：{1}" -f $f.RemotePath, $_.Exception.Message)
+                }
+            }
+        }
+    }
+
+    # 同步更新 last-run.json
+    $pickedIds = @($picked | ForEach-Object { $_.FolderId })
+    Remove-FolderFromState -FolderIds $pickedIds
+    Write-Ok ("已取消 {0} 个 folder 的共享" -f $picked.Count)
+}
+
+# -------- Action: unpair --------
+function Invoke-UnpairAction {
+    Write-Host ""
+    Write-Host "=== Obsidian 同步工具 · 解除设备配对 ===" -ForegroundColor Cyan
+    Write-Host "版本: $SCRIPT_VERSION" -ForegroundColor Gray
+    Write-Host ""
+
+    Initialize-ManagementContext -RequireLocalApi -RequireRemoteApi
+    Restore-RemoteDeviceIdFromState
+
+    if ([string]::IsNullOrEmpty($global:REMOTE_DEVICE_ID)) {
+        throw "未能获取远端 Device ID（last-run.json 缺失且远端 API 未返回）"
+    }
+    if ([string]::IsNullOrEmpty($global:LOCAL_DEVICE_ID)) {
+        throw "未能获取本机 Device ID"
+    }
+
+    Write-Host ""
+    Write-Host "本次将解除下列设备配对：" -ForegroundColor Yellow
+    Write-Host ("   本地 Device    {0}" -f $global:LOCAL_DEVICE_ID) -ForegroundColor Cyan
+    Write-Host ("   服务器 Device  {0}" -f $global:REMOTE_DEVICE_ID) -ForegroundColor Cyan
+    Write-Host ("   服务器地址     {0}@{1}:{2}" -f $global:SSH_USER, $global:SSH_HOST, $global:SSH_PORT) -ForegroundColor Gray
+    Write-Host ""
+    Write-Warn "解除配对后，两端共享的所有 folder 都会因为失去对端而停止同步；"
+    Write-Warn "folder 配置本身不会自动删除，建议一并清理以避免残留 stale 条目。"
+    $alsoDeleteFolders = Confirm "同时删除两端所有共享 folder 的配置（不删除实际数据文件）？" "Y"
+    if (-not (Confirm "确认解除设备配对？" "N")) {
+        Write-Info "已取消"
+        return
+    }
+
+    if ($alsoDeleteFolders) {
+        $inventory = @(Get-ManagedFolderInventory)
+        foreach ($f in $inventory) {
+            Invoke-DeleteFolderBothSides -FolderId $f.FolderId
+        }
+        if ($inventory.Count -gt 0) {
+            $idsToRemove = @($inventory | ForEach-Object { $_.FolderId })
+            Remove-FolderFromState -FolderIds $idsToRemove
+        }
+    }
+
+    # 1) 本地删除远端设备
+    try {
+        $null = Invoke-LocalApi -Method DELETE -Path "/rest/config/devices/$($global:REMOTE_DEVICE_ID)" -Retries 2
+        Write-Ok "本地 Syncthing 已移除服务器设备"
+    } catch {
+        Write-Warn "本地移除服务器设备失败：$($_.Exception.Message)"
+    }
+    # 2) 远端删除本地设备
+    try {
+        $null = Invoke-RemoteApi -Method DELETE -Path "/rest/config/devices/$($global:LOCAL_DEVICE_ID)" -Retries 2
+        Write-Ok "远端 Syncthing 已移除本地设备"
+    } catch {
+        Write-Warn "远端移除本地设备失败：$($_.Exception.Message)"
+    }
+
+    Write-Ok "设备配对已解除"
+}
+
+# -------- Action: uninstall --------
+function Invoke-UninstallAction {
+    Write-Host ""
+    Write-Host "=== Obsidian 同步工具 · 完全卸载 ===" -ForegroundColor Red
+    Write-Host "版本: $SCRIPT_VERSION" -ForegroundColor Gray
+    Write-Host ""
+    Write-Warn "此操作将："
+    Write-Host "  • 停止并禁用服务器端 systemd 服务 syncthing@<user>" -ForegroundColor Gray
+    Write-Host "  • 删除服务器端 ~/.local/state/syncthing 配置目录" -ForegroundColor Gray
+    Write-Host "  • 停止本机 Syncthing 进程，删除 $LOCAL_SYNCTHING_HOME / $LOCAL_SYNCTHING_CONFIG_DIR" -ForegroundColor Gray
+    Write-Host "  • 删除本地状态目录 $STATE_DIR（含 last-run.json、日志、加密凭据）" -ForegroundColor Gray
+    Write-Host ""
+    Write-Info "默认保留 Vault 笔记文件（本地 & 远端 /data/obsidian）。"
+    $rmVaultLocal  = Confirm "额外删除本地 Vault 笔记目录？（强烈不建议！）" "N"
+    $rmVaultRemote = Confirm "额外删除远端 /data/obsidian 目录？" "N"
+    Write-Host ""
+    if (-not (Confirm "再次确认：以上操作不可逆，继续？" "N")) {
+        Write-Info "已取消"
+        return
+    }
+
+    # 先尝试从 last-run.json 收集本地 Vault 路径
+    $localVaultPaths = @()
+    try {
+        if (Test-Path $STATE_FILE) {
+            $cfg = Get-Content $STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($cfg.PSObject.Properties.Name -contains 'folders') {
+                foreach ($f in @($cfg.folders)) {
+                    if ($f.localPath) { $localVaultPaths += [string]$f.localPath }
+                }
+            }
+        }
+    } catch { }
+
+    # 1) 采集 SSH（uninstall 也需要登陆服务器；若连不上就只清本地）
+    Load-LastConfig
+    Collect-UserInput
+    $serverReachable = $false
+    try {
+        $serverReachable = [bool](Test-SSHConnection)
+    } catch {
+        $serverReachable = $false
+    }
+    if (-not $serverReachable) {
+        Write-Warn "服务器 SSH 连接失败；将仅清理本地"
+    }
+
+    # 2) 远端清理
+    if ($serverReachable) {
+        Write-Step "清理服务器端"
+        $rmRemote = if ($rmVaultRemote) { "yes" } else { "no" }
+        # 用单引号 here-string 避免 PowerShell 对 bash 的反引号 / $ 做任何插值；
+        # 唯一的 PS 变量 $rmRemote 通过 -replace 注入占位符 __RM_REMOTE__
+        $scriptTpl = @'
+set -e
+sudo_cmd=''
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then sudo_cmd='sudo '; fi
+
+# 停止并禁用 systemd 服务（兼容 syncthing@<user> / 直接 syncthing 两种命名）
+for svc in syncthing syncthing@root syncthing@$(whoami); do
+    $sudo_cmd systemctl stop "$svc" 2>/dev/null || true
+    $sudo_cmd systemctl disable "$svc" 2>/dev/null || true
+done
+
+# 杀掉兜底进程
+$sudo_cmd pkill -f "syncthing serve" 2>/dev/null || true
+
+# 删配置目录（root + 当前用户都试一遍）
+rm -rf "$HOME/.local/state/syncthing" 2>/dev/null || true
+rm -rf "$HOME/.config/syncthing"      2>/dev/null || true
+$sudo_cmd rm -rf /root/.local/state/syncthing /root/.config/syncthing 2>/dev/null || true
+
+# 可选：删除 /data/obsidian
+if [ "__RM_REMOTE__" = "yes" ]; then
+    $sudo_cmd rm -rf /data/obsidian 2>/dev/null || true
+    echo "remote_data_removed"
+else
+    echo "remote_data_kept"
+fi
+
+echo "remote_uninstall_done"
+'@
+        $script = $scriptTpl -replace '__RM_REMOTE__', $rmRemote
+        try {
+            $r = Invoke-SSHScript -Script $script
+            if ($r.Output -match "remote_uninstall_done") {
+                Write-Ok "服务器端清理完成"
+            } else {
+                Write-Warn "服务器端清理可能不完整，请手动检查"
+                if ($r.Output) { Write-Hint ($r.Output -split "`n" | Select-Object -Last 5 | Out-String).Trim() }
+            }
+        } catch {
+            Write-Warn "执行服务器端清理失败：$($_.Exception.Message)"
+        }
+    }
+
+    # 3) 本地 Syncthing 进程
+    Write-Step "清理本机 Syncthing"
+    try {
+        if (Test-Path $LOCAL_SYNCTHING_PID_FILE) {
+            $oldPid = (Get-Content $LOCAL_SYNCTHING_PID_FILE -Raw -ErrorAction SilentlyContinue).Trim()
+            if ($oldPid -and ($oldPid -as [int])) {
+                try { Stop-Process -Id ([int]$oldPid) -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+        # 兜底：按可执行路径特征杀
+        Get-Process -Name "syncthing" -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and $_.Path.ToLower().Contains("obsidian-sync")
+        } | ForEach-Object {
+            try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        Write-Ok "已停止本机 Syncthing 进程"
+    } catch {
+        Write-Warn "停止本机 Syncthing 进程失败：$($_.Exception.Message)"
+    }
+
+    # 4) 删除本地 Syncthing 安装和配置目录
+    foreach ($p in @($LOCAL_SYNCTHING_HOME, $LOCAL_SYNCTHING_CONFIG_DIR)) {
+        if ($p -and (Test-Path $p)) {
+            try {
+                Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
+                Write-Ok ("已删除 {0}" -f $p)
+            } catch {
+                Write-Warn ("删除 {0} 失败：{1}" -f $p, $_.Exception.Message)
+            }
+        }
+    }
+
+    # 5) 可选：删本地 Vault
+    if ($rmVaultLocal -and $localVaultPaths.Count -gt 0) {
+        foreach ($vp in $localVaultPaths) {
+            if (Test-Path $vp) {
+                try {
+                    Remove-Item -Path $vp -Recurse -Force -ErrorAction Stop
+                    Write-Ok ("已删除本地 Vault：{0}" -f $vp)
+                } catch {
+                    Write-Warn ("删除 Vault 失败：{0}：{1}" -f $vp, $_.Exception.Message)
+                }
+            }
+        }
+    }
+
+    # 6) 清理 Windows 凭据（cmdkey 可见条目）
+    try {
+        $credTargets = @()
+        if ($global:SSH_HOST -and $global:SSH_USER -and $global:SSH_PORT) {
+            $credTargets += "obsidian-sync-$($global:SSH_USER)@$($global:SSH_HOST):$($global:SSH_PORT)"
+        }
+        if ($global:SSH_HOST) {
+            $credTargets += "obsidian-sync-gui-$($global:SSH_HOST)"
+        }
+        foreach ($t in $credTargets) {
+            & cmdkey.exe /delete:$t 2>&1 | Out-Null
+        }
+    } catch { }
+
+    # 7) 删 state 目录（最后做，因为前面的日志/凭据文件都在里面）
+    Stop-SSHTunnel  # 关掉可能存在的隧道，释放 state 目录下的日志句柄
+    if (Test-Path $STATE_DIR) {
+        try {
+            Remove-Item -Path $STATE_DIR -Recurse -Force -ErrorAction Stop
+            Write-Ok ("已删除本地状态目录 {0}" -f $STATE_DIR)
+        } catch {
+            Write-Warn ("删除本地状态目录失败：{0}；请手动清理" -f $_.Exception.Message)
+        }
+    }
+
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Green
+    Write-Host "║                  ✅  卸  载  完  成                      ║" -ForegroundColor Green
+    Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Green
+}
+
+# -------- Action: diagnose --------
+function Invoke-DiagnoseAction {
+    Write-Host ""
+    Write-Host "=== Obsidian 同步工具 · 同步问题诊断 ===" -ForegroundColor Cyan
+    Write-Host "版本: $SCRIPT_VERSION" -ForegroundColor Gray
+    Write-Host ""
+
+    Initialize-ManagementContext -RequireLocalApi -RequireRemoteApi
+    Restore-RemoteDeviceIdFromState
+
+    # 从 last-run.json 取第一个 folder；若有就诊断它，没有就走通用诊断
+    $targetFolder = $null
+    try {
+        if (Test-Path $STATE_FILE) {
+            $cfg = Get-Content $STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($cfg.PSObject.Properties.Name -contains 'folders' `
+                -and @($cfg.folders).Count -gt 0 `
+                -and $cfg.folders[0].folderID) {
+                $targetFolder = [string]$cfg.folders[0].folderID
+            }
+        }
+    } catch { }
+
+    if ($targetFolder) {
+        Write-Info "诊断文件夹：$targetFolder"
+        Diagnose-SyncIssues -FolderId $targetFolder
+    } else {
+        Diagnose-SyncIssues
+    }
+}
+
+# -------- 首屏交互菜单（Action=menu 时触发） --------
+function Show-ActionMenu {
+    Write-Host ""
+    Write-Host "=== Obsidian 同步工具 ($SCRIPT_VERSION) ===" -ForegroundColor Cyan
+    Write-Host "请选择要执行的操作：" -ForegroundColor White
+    Write-Host "  1) 部署 / 新增 Vault                （默认）" -ForegroundColor Green
+    Write-Host "  2) 取消某个 folder 的共享" -ForegroundColor Yellow
+    Write-Host "  3) 解除本地 ↔ 服务器 的设备配对" -ForegroundColor Yellow
+    Write-Host "  4) 完全卸载（清空配置）" -ForegroundColor Red
+    Write-Host "  5) 同步问题诊断" -ForegroundColor Gray
+    Write-Host "  0) 退出" -ForegroundColor DarkGray
+    Write-Host ""
+    $ans = Read-WithDefault "请输入序号" "1"
+    switch ($ans.Trim()) {
+        "1" { return "deploy" }
+        "2" { return "remove-folder" }
+        "3" { return "unpair" }
+        "4" { return "uninstall" }
+        "5" { return "diagnose" }
+        "0" { return "exit" }
+        default { return "deploy" }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 动作分发入口
+# ---------------------------------------------------------------------------
+function Invoke-Action {
+    param([string]$Name)
+
+    try {
+        # 管理员权限检查（所有动作都可能需要管理员，uninstall 和 deploy 尤其）
+        if (-not (Test-IsAdministrator)) {
+            if (-not (Request-AdminElevation)) {
+                throw "需要管理员权限才能继续，请以管理员身份重新运行脚本"
+            }
+        }
+
+        switch ($Name) {
+            'deploy'         { Main }
+            'remove-folder'  { Invoke-RemoveFolderAction }
+            'unpair'         { Invoke-UnpairAction }
+            'uninstall'      { Invoke-UninstallAction }
+            'diagnose'       { Invoke-DiagnoseAction }
+            default          { Main }
+        }
+    } catch {
+        Write-Err "执行失败: $($_.Exception.Message)"
+        # 管理类动作打印详细堆栈，方便定位
+        if ($Name -in @('remove-folder','unpair','uninstall','diagnose')) {
+            Write-Host "" -ForegroundColor DarkGray
+            Write-Host "════════ 详细错误信息 ════════" -ForegroundColor DarkGray
+            if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+                Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkGray
+            }
+            if ($_.ScriptStackTrace) {
+                Write-Host "" -ForegroundColor DarkGray
+                Write-Host "调用栈:" -ForegroundColor DarkGray
+                Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+            }
+            Write-Host "════════════════════════════════" -ForegroundColor DarkGray
+        }
+        exit 1
+    } finally {
+        Stop-SSHTunnel
+    }
+}
+
 # 执行主函数
-Main
+if ($Action -eq 'menu') {
+    $chosen = Show-ActionMenu
+    if ($chosen -eq 'exit') { return }
+    Invoke-Action -Name $chosen
+} else {
+    Invoke-Action -Name $Action
+}
