@@ -2075,10 +2075,24 @@ $sudo_cmd install -m 0755 "$extracted_dir/syncthing" /usr/local/bin/syncthing
 cd /
 rm -rf "$tmpdir"
 
-# 7) systemd unit
-if [ ! -f /etc/systemd/system/syncthing@.service ] && [ ! -f /lib/systemd/system/syncthing@.service ]; then
-    echo "写入 /etc/systemd/system/syncthing@.service"
-    $sudo_cmd tee /etc/systemd/system/syncthing@.service >/dev/null <<'UNIT'
+# 7) systemd unit —— 关键：WorkingDirectory=/data/obsidian
+# 为什么需要？
+#   Syncthing v2 某些版本在 POST/PATCH folder 时会把请求 body 里的绝对 path 错误地
+#   存成相对路径（bug），之后 syncthing 进程读 config.xml 时会按 **进程 cwd** 解析
+#   相对路径。若 unit 不指定 WorkingDirectory，systemd 默认 cwd = "/"，于是数据会
+#   被同步到 "/xxx" 而非期望的 "/data/obsidian/xxx"。
+#   这里强制 WorkingDirectory=/data/obsidian，使相对路径 "xxx" 仍落在正确前缀下。
+UNIT_FILE="/etc/systemd/system/syncthing@.service"
+NEED_WRITE_UNIT=1
+if [ -f "$UNIT_FILE" ]; then
+    if grep -q "^WorkingDirectory=/data/obsidian" "$UNIT_FILE" 2>/dev/null; then
+        NEED_WRITE_UNIT=0
+    fi
+fi
+if [ "$NEED_WRITE_UNIT" = "1" ]; then
+    echo "写入/更新 $UNIT_FILE（确保 WorkingDirectory 正确）"
+    $sudo_cmd mkdir -p /data/obsidian
+    $sudo_cmd tee "$UNIT_FILE" >/dev/null <<'UNIT'
 [Unit]
 Description=Syncthing - Open Source Continuous File Synchronization for %I
 Documentation=man:syncthing(1)
@@ -2086,6 +2100,7 @@ After=network.target
 
 [Service]
 User=%i
+WorkingDirectory=/data/obsidian
 ExecStart=/usr/local/bin/syncthing serve --no-browser --no-restart --logflags=0
 Restart=on-failure
 RestartSec=5
@@ -2102,6 +2117,12 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 UNIT
     $sudo_cmd systemctl daemon-reload
+    # 如果服务正在运行，重启以应用新的 WorkingDirectory
+    if $sudo_cmd systemctl is-active syncthing@*.service >/dev/null 2>&1; then
+        for u in $($sudo_cmd systemctl list-units --type=service --state=active --no-legend 'syncthing@*' 2>/dev/null | awk '{print $1}'); do
+            [ -n "$u" ] && $sudo_cmd systemctl restart "$u" || true
+        done
+    fi
 fi
 
 echo "INSTALLED: $(syncthing --version 2>&1 | head -1)"
@@ -3836,7 +3857,8 @@ function New-FolderJson {
         [Parameter(Mandatory=$true)][string]$FolderId,
         [Parameter(Mandatory=$true)][string]$Label,
         [Parameter(Mandatory=$true)][string]$Path,
-        [Parameter(Mandatory=$true)][string[]]$PeerDeviceIds
+        [Parameter(Mandatory=$true)][string[]]$PeerDeviceIds,
+        [bool]$Paused = $false
     )
     # devices = 自己 + 对端（去重、去空、去掘自己）
     $devices = @( [ordered]@{ deviceID = $global:LOCAL_DEVICE_ID } )
@@ -3877,7 +3899,7 @@ function New-FolderJson {
         maxConflicts           = 10
         disableSparseFiles     = $false
         disableTempIndexes     = $false
-        paused                 = $false
+        paused                 = $Paused
         weakHashThresholdPct   = 25
         markerName             = ".stfolder"
         copyOwnershipFromParent = $false
@@ -3997,10 +4019,19 @@ function Update-FolderDevicesIfMissing {
 # PowerShell 双引号字符串里嵌套 `$` / `"` 的转义陷阱
 function Invoke-RemotePrepareFolderDir {
     param([Parameter(Mandatory=$true)][string]$RemotePath)
+    # 关键：同时创建 Syncthing 的 folder marker (.stfolder)。
+    # 这是 Syncthing v2 的"数据丢失保护"机制——若 folder 根目录下没有 .stfolder，
+    # 服务端会拒绝接收/应用任何来自对端的文件更改，对外表现为：
+    #   - state=idle、needFiles=0、但 completion 永远卡在某个百分比；
+    #   - syncthing 日志出现 "folder marker missing (this indicates potential data loss...)";
+    # 本脚本负责创建远端目录，于是顺手把 marker 也建好（幂等，成本几乎为零），
+    # 避免依赖 Syncthing 自己在扫描时 auto-create（在某些启动顺序 / 权限组合下不会建）。
     $tmpl = @'
 set -e
 sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
 $sudo_cmd mkdir -p "__REMOTE_PATH__"
+$sudo_cmd mkdir -p "__REMOTE_PATH__/.stfolder"
+$sudo_cmd chmod 755 "__REMOTE_PATH__/.stfolder"
 $sudo_cmd chown -R "__RUN_USER__":"__RUN_USER__" "__REMOTE_PATH__"
 echo OK
 '@
@@ -4010,6 +4041,341 @@ echo OK
     if ($r.Output -notmatch 'OK') {
         throw "创建远端目录失败：$RemotePath`n$($r.Output)"
     }
+}
+
+# ---------------------------------------------------------------------------
+# 修正远端 folder 的 path 字段
+# ---------------------------------------------------------------------------
+# 场景：远端 folder 是被更早的脚本 / auto-accept 在错误路径（例如 ~/Sync/<id>、
+# /root/Sync/<id>）下建出来的；当前脚本"幂等跳过"时不会再次指定 path，导致
+# 数据始终同步到非预期的位置。
+#
+# 本函数职责：
+#   1) 拉取远端 folder 当前 path
+#   2) 与 $ExpectedPath 比较，一致直接 return
+#   3) 不一致则：
+#       a. 确保新目录存在并赋权（Invoke-RemotePrepareFolderDir）
+#       b. 若旧目录下有数据：在远端用 mv + rsync 迁移到新目录
+#       c. PATCH folder.path = $ExpectedPath
+#       d. 触发 rescan
+# ---------------------------------------------------------------------------
+function Repair-RemoteFolderPath {
+    param(
+        [Parameter(Mandatory=$true)][string]$FolderId,
+        [Parameter(Mandatory=$true)][string]$ExpectedPath
+    )
+
+    $apiPath = "/rest/config/folders/$FolderId"
+    try {
+        $folder = Invoke-RemoteApi -Method GET -Path $apiPath -Retries 2
+    } catch {
+        Write-Warn ("读取远端 folder [{0}] 配置失败：{1}" -f $FolderId, $_.Exception.Message)
+        return $false
+    }
+    if (-not $folder) {
+        Write-Warn ("远端 folder [{0}] 不存在，跳过路径修正" -f $FolderId)
+        return $false
+    }
+
+    $curPath = [string]$folder.path
+    if ([string]::IsNullOrEmpty($curPath)) {
+        Write-Warn ("远端 folder [{0}] 未返回 path 字段，跳过" -f $FolderId)
+        return $false
+    }
+
+    # 规范化后比较（去掉末尾斜杠）
+    $norm = { param($p) ($p -replace '/+$','') }
+    if ((& $norm $curPath) -eq (& $norm $ExpectedPath)) {
+        # 已经是期望路径
+        return $true
+    }
+
+    Write-Warn ("远端 folder [{0}] 当前 path 与期望不一致" -f $FolderId)
+    Write-Host ("    当前: {0}" -f $curPath)     -ForegroundColor Yellow
+    Write-Host ("    期望: {0}" -f $ExpectedPath) -ForegroundColor Yellow
+
+    # ----------------------------------------------------------------------
+    # 关键时序保护：先 PAUSE 该 folder，阻止 Syncthing 继续在错误路径下写入。
+    # 因为 Syncthing v2 服务端会把 POST body 里的绝对 path 存成相对路径（bug），
+    # 然后 systemd 拉起的 syncthing 进程默认 cwd=/，导致相对路径 "x" 解析到 "/x"，
+    # 数据会立刻开始往错位置写。我们必须先暂停，再搬数据，再 PATCH，再恢复。
+    # ----------------------------------------------------------------------
+    try {
+        $null = Invoke-RemoteApi -Method PATCH -Path $apiPath -Body (@{paused=$true}|ConvertTo-Json -Compress) -Retries 2
+        Write-Info "已临时暂停该 folder 的同步，避免搬运过程中继续写入"
+        Start-Sleep -Milliseconds 500
+    } catch {
+        Write-Warn ("暂停 folder 失败（继续进行，但可能有少量文件竞争）：{0}" -f $_.Exception.Message)
+    }
+
+    # ----------------------------------------------------------------------
+    # 探测"旧路径"的真实位置：
+    #   - 绝对路径：直接用；
+    #   - 相对路径：candidate = /<rel> 和 $REMOTE_HOME/<rel>（systemd 默认 cwd=/，
+    #     但万一服务端是通过 syncthing paths 的默认 basePath 解析也要兜底），
+    #     哪个存在且非空就用哪个；都非空则按优先级 /<rel> 为主，$HOME/<rel> 合并。
+    # ----------------------------------------------------------------------
+    $oldCandidates = @()
+    if ($curPath.StartsWith("/")) {
+        $oldCandidates += $curPath
+    } else {
+        # systemd 拉起的 syncthing cwd 是 /（unit 未设置 WorkingDirectory）
+        $oldCandidates += ("/" + $curPath.TrimStart("./"))
+        if (-not [string]::IsNullOrEmpty($global:REMOTE_HOME)) {
+            $oldCandidates += ($global:REMOTE_HOME.TrimEnd("/") + "/" + $curPath.TrimStart("./"))
+        }
+    }
+    # 去重
+    $oldCandidates = $oldCandidates | Select-Object -Unique
+
+    # 探测每个候选目录是否非空
+    $candListShell = ($oldCandidates | ForEach-Object { "`"" + ($_ -replace '"','\"') + "`"" }) -join " "
+    $probeTmpl = @'
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+for p in __CAND_LIST__; do
+    if [ -d "$p" ] && [ -n "$($sudo_cmd ls -A "$p" 2>/dev/null)" ]; then
+        echo "NONEMPTY:$p"
+    elif [ -d "$p" ]; then
+        echo "EMPTY:$p"
+    else
+        echo "MISSING:$p"
+    fi
+done
+'@
+    $nonEmptyOld = @()
+    try {
+        $probe = $probeTmpl.Replace("__CAND_LIST__", $candListShell)
+        $pr = Invoke-SSHScript -Script $probe -ThrowOnError
+        foreach ($line in ($pr.Output -split "`r?`n")) {
+            if ($line -match '^NONEMPTY:(.+)$') { $nonEmptyOld += $Matches[1] }
+        }
+    } catch {
+        Write-Warn ("探测旧路径失败：{0}" -f $_.Exception.Message)
+    }
+
+    if ($nonEmptyOld.Count -gt 0) {
+        Write-Warn ("检测到旧数据所在目录：")
+        foreach ($d in $nonEmptyOld) { Write-Host ("      ▸ {0}" -f $d) -ForegroundColor Yellow }
+    } else {
+        Write-Info "未检测到旧路径下的残留数据，将直接修正配置"
+    }
+
+    # 1) 新目录就绪
+    try {
+        Invoke-RemotePrepareFolderDir -RemotePath $ExpectedPath
+    } catch {
+        Write-Warn ("创建目标目录失败：{0}" -f $_.Exception.Message)
+        # 取消暂停（不然 folder 一直卡住）
+        try { $null = Invoke-RemoteApi -Method PATCH -Path $apiPath -Body (@{paused=$false}|ConvertTo-Json -Compress) -Retries 1 } catch {}
+        return $false
+    }
+
+    # 2) 远端迁移数据（可能有多个源）
+    foreach ($src in $nonEmptyOld) {
+        $tmpl = @'
+set -e
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+SRC="__SRC__"
+DST="__DST__"
+RUNUSER="__RUN_USER__"
+
+if [ ! -d "$SRC" ]; then
+    echo "NO_SRC"
+    exit 0
+fi
+
+# 若 src 为空目录，不需要搬数据，直接清掉避免残留
+if [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
+    $sudo_cmd rmdir "$SRC" 2>/dev/null || true
+    echo "SRC_EMPTY"
+    exit 0
+fi
+
+# 如果 DST 已经非空，把 src 内容并入（同名保留 dst 版本）
+if [ -n "$(ls -A "$DST" 2>/dev/null)" ]; then
+    if command -v rsync >/dev/null 2>&1; then
+        $sudo_cmd rsync -a --ignore-existing "$SRC"/ "$DST"/
+    else
+        $sudo_cmd cp -an "$SRC"/. "$DST"/
+    fi
+    $sudo_cmd rm -rf "$SRC"
+    echo "MERGED"
+else
+    # 同文件系统下用 mv 速度最快；跨文件系统自动回退
+    $sudo_cmd mv "$SRC"/. "$DST"/ 2>/dev/null || {
+        if command -v rsync >/dev/null 2>&1; then
+            $sudo_cmd rsync -a "$SRC"/ "$DST"/
+        else
+            $sudo_cmd cp -a "$SRC"/. "$DST"/
+        fi
+        $sudo_cmd rm -rf "$SRC"
+    }
+    [ -d "$SRC" ] && $sudo_cmd rmdir "$SRC" 2>/dev/null || true
+    echo "MOVED"
+fi
+
+$sudo_cmd chown -R "$RUNUSER":"$RUNUSER" "$DST"
+echo DONE
+'@
+        $script = $tmpl.Replace("__SRC__", $src)
+        $script = $script.Replace("__DST__", $ExpectedPath)
+        $script = $script.Replace("__RUN_USER__", $global:REMOTE_RUN_USER)
+
+        try {
+            $r = Invoke-SSHScript -Script $script -ThrowOnError
+            if ($r.Output -match 'MERGED') {
+                Write-Ok ("已合并：{0} -> {1}（同名以目标为准）" -f $src, $ExpectedPath)
+            } elseif ($r.Output -match 'MOVED') {
+                Write-Ok ("已搬运：{0} -> {1}" -f $src, $ExpectedPath)
+            } elseif ($r.Output -match 'SRC_EMPTY') {
+                Write-Info ("源目录为空已清理：{0}" -f $src)
+            } elseif ($r.Output -match 'NO_SRC') {
+                # 静默
+            } else {
+                Write-Warn ("迁移脚本返回异常：{0}" -f $r.Output)
+            }
+        } catch {
+            Write-Warn ("远端数据迁移失败（{0}）：{1}" -f $src, $_.Exception.Message)
+            # 取消暂停再返回
+            try { $null = Invoke-RemoteApi -Method PATCH -Path $apiPath -Body (@{paused=$false}|ConvertTo-Json -Compress) -Retries 1 } catch {}
+            return $false
+        }
+    }
+
+    # 3) PATCH folder.path 并恢复 paused=false
+    #    Syncthing v2 某些版本会在每次 POST/PATCH 时把绝对 path 相对化（bug），
+    #    所以这里 PATCH 之后立刻 GET 验证；如仍是相对路径则 fallback 到 PUT 整条。
+    $patched = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $patchBody = @{ path = $ExpectedPath; paused = $false } | ConvertTo-Json -Depth 3 -Compress
+        try {
+            $null = Invoke-RemoteApi -Method PATCH -Path $apiPath -Body $patchBody -Retries 2
+        } catch {
+            Write-Warn ("PATCH path 失败（第 {0} 次）：{1}" -f $attempt, $_.Exception.Message)
+        }
+        # 验证
+        Start-Sleep -Milliseconds 400
+        try {
+            $verify = Invoke-RemoteApi -Method GET -Path $apiPath -Retries 2
+            $newPath = [string]$verify.path
+            if ((& $norm $newPath) -eq (& $norm $ExpectedPath)) {
+                Write-Ok ("远端 folder [{0}] 的 path 已更新为 {1}" -f $FolderId, $ExpectedPath)
+                $patched = $true
+                break
+            } else {
+                Write-Warn ("第 {0} 次 PATCH 后 path 仍为 '{1}'，即将重试..." -f $attempt, $newPath)
+            }
+        } catch {
+            Write-Warn ("验证 folder.path 失败（第 {0} 次）：{1}" -f $attempt, $_.Exception.Message)
+        }
+    }
+
+    if (-not $patched) {
+        # fallback：PUT 整条
+        Write-Warn "PATCH 多次未能修正 path，改为 PUT 整体替换"
+        $folder | Add-Member -NotePropertyName path   -NotePropertyValue $ExpectedPath -Force
+        $folder | Add-Member -NotePropertyName paused -NotePropertyValue $false        -Force
+        $putBody = $folder | ConvertTo-Json -Depth 10 -Compress
+        try {
+            $null = Invoke-RemoteApi -Method PUT -Path $apiPath -Body $putBody -Retries 2
+            Start-Sleep -Milliseconds 400
+            $verify = Invoke-RemoteApi -Method GET -Path $apiPath -Retries 2
+            $newPath = [string]$verify.path
+            if ((& $norm $newPath) -eq (& $norm $ExpectedPath)) {
+                Write-Ok ("远端 folder [{0}] 的 path 已通过 PUT 更新为 {1}" -f $FolderId, $ExpectedPath)
+                $patched = $true
+            } else {
+                Write-Warn ("PUT 后 path 仍为 '{0}'" -f $newPath)
+            }
+        } catch {
+            Write-Warn ("PUT 整条替换失败：{0}" -f $_.Exception.Message)
+        }
+    }
+
+    if (-not $patched) {
+        # 终极 fallback：停服务 → 直接改 config.xml → 起服务
+        Write-Warn "API 方式均无法让服务端保存绝对 path，尝试离线直接修改 config.xml"
+        $stopStartTmpl = @'
+set -e
+sudo_cmd=""; [ "$(id -u)" -ne 0 ] && sudo_cmd="sudo"
+RUN_USER="__RUN_USER__"
+RUN_HOME="__RUN_HOME__"
+FOLDER_ID="__FOLDER_ID__"
+NEW_PATH="__NEW_PATH__"
+
+# 定位 config.xml
+CFG=""
+for p in "$RUN_HOME/.local/state/syncthing/config.xml" "$RUN_HOME/.config/syncthing/config.xml"; do
+    [ -f "$p" ] && CFG="$p" && break
+done
+if [ -z "$CFG" ]; then
+    echo "CFG_NOT_FOUND"
+    exit 0
+fi
+
+# 停服务
+$sudo_cmd systemctl stop "syncthing@${RUN_USER}.service" >/dev/null 2>&1 || true
+sleep 1
+
+# 用 python 改 xml（Debian/Ubuntu 默认带 python3）
+$sudo_cmd python3 - <<PYEOF
+import xml.etree.ElementTree as ET, sys
+cfg = r"$CFG"
+fid = r"$FOLDER_ID"
+newp = r"$NEW_PATH"
+tree = ET.parse(cfg)
+root = tree.getroot()
+changed = False
+for f in root.findall("folder"):
+    if f.get("id") == fid:
+        if f.get("path") != newp:
+            f.set("path", newp); changed = True
+if changed:
+    tree.write(cfg, encoding="utf-8", xml_declaration=True)
+    print("XML_UPDATED")
+else:
+    print("XML_NOCHANGE")
+PYEOF
+
+# 起服务
+$sudo_cmd systemctl start "syncthing@${RUN_USER}.service"
+echo DONE
+'@
+        $s = $stopStartTmpl.Replace("__RUN_USER__", $global:REMOTE_RUN_USER)
+        $s = $s.Replace("__RUN_HOME__", $global:REMOTE_HOME)
+        $s = $s.Replace("__FOLDER_ID__", $FolderId)
+        $s = $s.Replace("__NEW_PATH__", $ExpectedPath)
+        try {
+            $r2 = Invoke-SSHScript -Script $s -ThrowOnError
+            if ($r2.Output -match 'XML_UPDATED') {
+                Write-Ok "已通过直接修改 config.xml 方式修正 folder.path"
+                # 等待 Syncthing 重新启动（API 恢复可用）
+                Start-Sleep -Seconds 3
+                $patched = $true
+            } elseif ($r2.Output -match 'XML_NOCHANGE') {
+                Write-Info "config.xml 中 path 已经正确，无需改动"
+                $patched = $true
+            } else {
+                Write-Warn ("离线修改失败：{0}" -f $r2.Output)
+            }
+        } catch {
+            Write-Warn ("离线修改 config.xml 失败：{0}" -f $_.Exception.Message)
+        }
+    }
+
+    if (-not $patched) {
+        # 实在搞不定，确保至少取消暂停，让用户可以去 GUI 手工修
+        try { $null = Invoke-RemoteApi -Method PATCH -Path $apiPath -Body (@{paused=$false}|ConvertTo-Json -Compress) -Retries 1 } catch {}
+        Write-Warn "未能自动修正远端 folder.path，请登录 Syncthing GUI 手动把 path 改为：$ExpectedPath"
+        return $false
+    }
+
+    # 4) 触发一次重新扫描
+    try {
+        $null = Invoke-RemoteApi -Method POST -Path "/rest/db/scan?folder=$FolderId" -Retries 1
+    } catch { }
+
+    return $true
 }
 
 function Wait-FolderScan {
@@ -4231,6 +4597,17 @@ function Add-OneSharedVault {
         # 如果本地已存在，检查服务器端是否也存在相同的文件夹ID
         if (Test-FolderExists -Scope remote -FolderId $folderId) {
             Write-Ok "服务器已存在 folder [$folderId]（幂等跳过）"
+            # 幂等自愈⓪：即便走"幂等跳过"分支，也要确保 remotePath 目录 + .stfolder marker 存在。
+            # 历史遗留：旧版脚本未建 marker，或运维手动 rm 过 marker，都会让服务端进入
+            # "folder marker missing" 保护模式，表现为同步永远卡在某个百分比。
+            try {
+                Invoke-RemotePrepareFolderDir -RemotePath $remotePath
+            } catch {
+                Write-Warn ("补建远端目录/marker 失败（将继续，后续 Repair 步骤可能还会兜底）：{0}" -f $_.Exception.Message)
+            }
+            # 幂等自愈①：远端 folder.path 可能被早期脚本 / auto-accept 设成了非期望路径
+            # （如 ~/Sync/<id>、/root/Sync/<id>），此处自动修正到 /data/obsidian/<dir>/
+            $null = Repair-RemoteFolderPath -FolderId $folderId -ExpectedPath $remotePath
             # 幂等自愈②：远端 folder 存在，但 devices 里可能缺 LOCAL_DEVICE_ID
             # （这是老版本脚本的核心 bug：首次部署时本地 Device ID 读错了，
             #  导致远端 folder 自始至终没把真·本地 device 列为 peer，于是从不同步）
@@ -4258,15 +4635,23 @@ function Add-OneSharedVault {
         # 3) 服务器端幂等：folderId 已存在 → 跳过
         if (Test-FolderExists -Scope remote -FolderId $folderId) {
             Write-Ok "服务器已存在 folder [$folderId]（幂等跳过）"
+            # 幂等自愈：远端 folder.path 可能被 auto-accept 设到了默认位置，自动修正
+            $null = Repair-RemoteFolderPath -FolderId $folderId -ExpectedPath $remotePath
             # 幂等自愈：远端 folder 可能缺 LOCAL_DEVICE_ID（上一次运行时本地 ID 被读错）
             $null = Update-FolderDevicesIfMissing -Scope remote -FolderId $folderId -RequiredDeviceId $global:LOCAL_DEVICE_ID
         } else {
             # 服务器端：仅与本地一台对端配对
-            $body = New-FolderJson -FolderId $folderId -Label $name -Path $remotePath -PeerDeviceIds @($global:LOCAL_DEVICE_ID)
+            # 关键：Paused=$true 先行暂停，防止服务端把 path 相对化后立刻在错误目录启动同步；
+            # 之后 Repair-RemoteFolderPath 会把 path 校准并恢复 paused=false
+            $body = New-FolderJson -FolderId $folderId -Label $name -Path $remotePath -PeerDeviceIds @($global:LOCAL_DEVICE_ID) -Paused $true
             $null = Invoke-RemoteApi -Method POST -Path "/rest/config/folders" -Body $body
             $global:ROLLBACK_STACK += "remote_folder:$folderId"
-            Write-Ok "服务器 folder 已添加"
-            # 防御性兜底：POST 之后再读回一次，若 devices 丢失则补上
+            Write-Ok "服务器 folder 已添加（暂停中，待路径校准）"
+            # 防御性兜底①：某些 Syncthing v2 版本在 POST 新 folder 时，会把 body 里的
+            # 绝对 path 错误地存成相对路径（相对于 Syncthing 运行用户家目录）。
+            # 这里立刻读回、比较、必要时 PATCH 修正，避免文件被同步到非预期位置。
+            $null = Repair-RemoteFolderPath -FolderId $folderId -ExpectedPath $remotePath
+            # 防御性兜底②：POST 之后再读回一次，若 devices 丢失则补上
             $null = Update-FolderDevicesIfMissing -Scope remote -FolderId $folderId -RequiredDeviceId $global:LOCAL_DEVICE_ID
         }
     }
